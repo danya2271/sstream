@@ -21,6 +21,7 @@ A high-performance covert channel over DNS, powered by QUIC multipath.
 * Adaptive congestion control for rate-limited resolvers
 * Parallel routing over multiple multiple rate-limited resolvers
 * 60% lower header overhead than DNSTT
+* Configure mtu
 
 ## Installation
 

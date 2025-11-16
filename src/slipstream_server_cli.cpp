@@ -9,6 +9,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     using MainArguments<ServerArgs>::MainArguments;
 
     int listen_port = option("dns-listen-port", 'l', "DNS listen port (default: 53)") = 53;
+    int mtu = option("mtu", 'm', "Mtu size") = 512;
     std::string target_address = option("target-address", 'a', "Target server address (default: 127.0.0.1:5201)") = "127.0.0.1:5201";
     std::string cert = option("cert", 'c', "Certificate file path (default: certs/cert.pem)") = "certs/cert.pem";
     std::string key = option("key", 'k', "Private key file path (default: certs/key.pem)") = "certs/key.pem";
@@ -70,6 +71,7 @@ int main(int argc, char** argv) {
 
     exit_code = picoquic_slipstream_server(
         args.listen_port,
+        args.mtu,
         (char*)args.cert.c_str(),
         (char*)args.key.c_str(),
         &target_address,

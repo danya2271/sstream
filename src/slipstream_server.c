@@ -677,7 +677,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     return ret;
 }
 
-int picoquic_slipstream_server(int server_port, const char* server_cert, const char* server_key,
+int picoquic_slipstream_server(int server_port, int mtu, const char* server_cert, const char* server_key,
                                struct sockaddr_storage* target_address, const char* domain_name) {
     /* Start: start the QUIC process with cert and key files */
     int ret = 0;
@@ -689,9 +689,6 @@ int picoquic_slipstream_server(int server_port, const char* server_cert, const c
 
     server_domain_name = strdup(domain_name);
     server_domain_name_len = strlen(domain_name);
-
-    // int mtu = 250;
-    int mtu = 900;
 
     /* Create config */
     picoquic_quic_config_t config;

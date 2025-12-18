@@ -151,11 +151,11 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     sockaddr_dummy(peer_addr);
     memcpy(&slot->local_addr, local_addr, sizeof(struct sockaddr_storage));
 
-#ifdef NODECODE
+    #ifdef NODECODE
     *dest_buf = malloc(src_buf_len);
     memcpy((void*)*dest_buf, src_buf, src_buf_len);
     return src_buf_len;
-#endif
+    #endif
 
     size_t packet_len = DNS_DECODEBUF_4K * sizeof(dns_decoded_t);
     dns_decoded_t* packet = slot->dns_decoded;
@@ -166,14 +166,7 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     }
 
     const dns_query_t *query = (dns_query_t*) packet;
-    if (!query->query) {
-        DBG_PRINTF("dns record is not a query", NULL);
-        slot->error = RCODE_FORMAT_ERROR;
-        return 0;
-    }
-
-    if (query->qdcount != 1) {
-        DBG_PRINTF("dns record should contain exactly one query", NULL);
+    if (!query->query || query->qdcount != 1) {
         slot->error = RCODE_FORMAT_ERROR;
         return 0;
     }
@@ -184,29 +177,64 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
         return 0;
     }
 
-    const ssize_t data_len = strlen(question->name) - server_domain_name_len - 1 - 1;
-    if (data_len <= 0) {
-        DBG_PRINTF("subdomain is empty", NULL);
-        slot->error = RCODE_NAME_ERROR;
-        return 0;
-    }
+    // --- MODIFIED LOGIC FOR RANDOMIZATION ---
+    // Format: [DATA].[RANDOM_ID].[SERVER_DOMAIN]
 
-    char data_buf[data_len];
-    memcpy(data_buf, question->name, data_len);
-    data_buf[data_len] = '\0';
-    const size_t encoded_len = slipstream_inline_undotify(data_buf, data_len);
+    size_t q_len = strlen(question->name);
 
-    char* decoded_buf = malloc(encoded_len);
-    const size_t decoded_len = b32_decode(decoded_buf, data_buf, encoded_len, false);
-    if (decoded_len == (size_t) -1) {
-        free(decoded_buf);
-        DBG_PRINTF("error decoding base32: %lu", decoded_len);
-        slot->error = RCODE_SERVER_FAILURE;
-        return 0;
-    }
+    // 1. Check if query ends with server domain
+    if (q_len <= server_domain_name_len ||
+        strcmp(question->name + q_len - server_domain_name_len, server_domain_name) != 0) {
+        DBG_PRINTF("Domain mismatch", NULL);
+    slot->error = RCODE_NAME_ERROR;
+    return 0;
+        }
 
-    *dest_buf = decoded_buf;
-    return decoded_len;
+        // 2. Isolate the part before the domain: "DATA.RANDOM_ID."
+        // We create a copy to modify it safely
+        size_t prefix_len = q_len - server_domain_name_len - 1; // -1 for the dot before domain
+        if (prefix_len <= 0) {
+            slot->error = RCODE_NAME_ERROR;
+            return 0;
+        }
+
+        char temp_buf[prefix_len + 1];
+        memcpy(temp_buf, question->name, prefix_len);
+        temp_buf[prefix_len] = '\0';
+
+        // 3. Find the LAST dot in "DATA.RANDOM_ID" to strip RANDOM_ID
+        char *last_dot = strrchr(temp_buf, '.');
+
+        size_t data_len;
+        if (last_dot != NULL) {
+            // If there is a dot, we strip everything after it (the random ID)
+            *last_dot = '\0';
+            data_len = strlen(temp_buf);
+        } else {
+            // If no dot found, assume it's just raw data (backward compatibility)
+            data_len = prefix_len;
+        }
+
+        if (data_len <= 0) {
+            slot->error = RCODE_NAME_ERROR;
+            return 0;
+        }
+
+        // 4. Decode the Clean Data
+        const size_t encoded_len = slipstream_inline_undotify(temp_buf, data_len);
+
+        char* decoded_buf = malloc(encoded_len);
+        const size_t decoded_len = b32_decode(decoded_buf, temp_buf, encoded_len, false);
+
+        if (decoded_len == (size_t) -1) {
+            free(decoded_buf);
+            DBG_PRINTF("error decoding base32", NULL);
+            slot->error = RCODE_SERVER_FAILURE;
+            return 0;
+        }
+
+        *dest_buf = decoded_buf;
+        return decoded_len;
 }
 
 slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_server_ctx_t* server_ctx,
@@ -650,7 +678,7 @@ int picoquic_slipstream_server(int server_port, int mtu, const char* server_cert
     debug_printf_push_stream(stderr);
 #endif
     picoquic_set_key_log_file_from_env(quic);
-    picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
+    picoquic_set_default_congestion_algorithm(quic, picoquic_bbr_algorithm);
 
     picoquic_packet_loop_param_t param = {0};
     param.local_af = AF_INET;

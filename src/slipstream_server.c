@@ -399,7 +399,7 @@ typedef struct st_slipstream_io_copy_args {
 } slipstream_io_copy_args;
 
 void* slipstream_io_copy(void* arg) {
-    char buffer[1024];
+    char buffer[65535];
     slipstream_io_copy_args* args = arg;
     int pipe = args->pipe;
     int socket = args->socket;

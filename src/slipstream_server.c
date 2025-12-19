@@ -220,7 +220,7 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
 
     memset(stream_ctx, 0, sizeof(slipstream_server_stream_ctx_t));
     stream_ctx->stream_id = stream_id;
-    stream_ctx->ref_count = 1; // Start with 1 reference (Main thread)
+    stream_ctx->ref_count = 1;
 
     if (pipe(stream_ctx->pipefd) < 0) {
         perror("pipe() failed");
@@ -236,6 +236,17 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
         free(stream_ctx);
         return NULL;
     }
+
+    struct timeval tv;
+    tv.tv_sec = 1800;
+    tv.tv_usec = 0;
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) < 0) {
+        perror("setsockopt failed");
+    }
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof tv) < 0) {
+        perror("setsockopt failed");
+    }
+
     stream_ctx->fd = sock_fd;
 
     if (server_ctx->first_stream == NULL) {
@@ -266,11 +277,11 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
 
     // 2. Close FDs immediately to interrupt any blocking calls in threads
     if (stream_ctx->fd != -1) {
+        shutdown(stream_ctx->fd, SHUT_RDWR);
         close(stream_ctx->fd);
         stream_ctx->fd = -1;
     }
-    // Closing pipe write end might help wake up readers, but we close both here carefully
-    // We set them to -1 to avoid double close in release
+
     if (stream_ctx->pipefd[0] != -1) {
         close(stream_ctx->pipefd[0]);
         stream_ctx->pipefd[0] = -1;
@@ -280,7 +291,7 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
         stream_ctx->pipefd[1] = -1;
     }
 
-    // 3. Release main thread's reference. If thread is running, memory stays alive.
+    // 3. Release main thread's reference.
     slipstream_stream_release(stream_ctx);
 }
 
@@ -622,7 +633,7 @@ int picoquic_slipstream_server(int server_port, int mtu, const char* server_cert
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
-    config.nb_connections = 8;
+    config.nb_connections = 65535;
     config.server_cert_file = server_cert;
     config.server_key_file = server_key;
 #ifdef BUILD_LOGLIB

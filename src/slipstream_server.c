@@ -184,9 +184,14 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
         return 0;
     }
 
-    const ssize_t data_len = strlen(question->name) - server_domain_name_len - 1 - 1;
+    size_t q_len = strlen(question->name);
+    if (q_len < server_domain_name_len + 2) {
+        slot->error = RCODE_NAME_ERROR;
+        return 0;
+    }
+
+    const ssize_t data_len = q_len - server_domain_name_len - 2;
     if (data_len <= 0) {
-        DBG_PRINTF("subdomain is empty", NULL);
         slot->error = RCODE_NAME_ERROR;
         return 0;
     }

@@ -282,7 +282,6 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
 
     // 2. Close FDs immediately to interrupt any blocking calls in threads
     if (stream_ctx->fd != -1) {
-        shutdown(stream_ctx->fd, SHUT_RDWR);
         close(stream_ctx->fd);
         stream_ctx->fd = -1;
     }

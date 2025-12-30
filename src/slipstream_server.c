@@ -624,7 +624,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     return ret;
 }
 
-int picoquic_slipstream_server(int server_port, int mtu, const char* server_cert, const char* server_key,
+int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const char* server_cert, const char* server_key,
                                struct sockaddr_storage* target_address, const char* domain_name) {
     int ret = 0;
     uint64_t current_time = 0;
@@ -668,7 +668,11 @@ int picoquic_slipstream_server(int server_port, int mtu, const char* server_cert
     picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
 
     picoquic_packet_loop_param_t param = {0};
-    param.local_af = AF_INET;
+    if (listen_ipv6) {
+        param.local_af = AF_INET6;
+    } else {
+        param.local_af = AF_INET;
+    }
     param.local_port = server_port;
     param.do_not_use_gso = 1;
     param.is_client = 0;

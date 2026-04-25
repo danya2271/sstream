@@ -152,11 +152,19 @@ android_api_level = ${API_LEVEL}
 cmake_toolchain_file = '${WRAPPER_FILE}'
 
 [built-in options]
-c_args = ['-Os']
-cpp_args = ['-Os']
-c_link_args = ['-Wl,-s']
-cpp_link_args = ['-Wl,-s']
+# Option 1: Aggressive speed optimization (may slightly increase size)
+c_args = ['-Oz', '-flto', '-march=armv8-a+crypto']
+cpp_args = ['-Oz', '-flto', '-march=armv8-a+crypto']
+
+# Linker flags to strip symbols and garbage collect unused code sections
+c_link_args = ['-flto', '-Wl,-s', '-Wl,--gc-sections']
+cpp_link_args = ['-flto', '-Wl,-s', '-Wl,--gc-sections']
+
+# Enable Position Independent Executable (required for Android)
 b_pie = true
+
+# Enable Link-Time Optimization
+b_lto = true
 
 [host_machine]
 system = 'android'

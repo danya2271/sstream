@@ -41,13 +41,16 @@ meson setup "$OUTPUT_DIR" \
     -Dc_args="-I$PROJ_ROOT/subprojects/picotls/include -ffunction-sections -fdata-sections" \
     -Dc_link_args="-Wl,--gc-sections -lcrypto -lssl -ldl"
 
-echo "=== 5. Compiling ==="
+echo "=== 5. Compiling Dependencies ==="
+# Собираем библиотеки квика (это обычно не падает)
+ninja -C "$OUTPUT_DIR" subprojects/picoquic/libpicoquic_core.a
 
-ninja -C "$OUTPUT_DIR" subprojects/picoquic/libpicoquic_core.a || true
-
-# Clear ccache to ensure we don't use old failed headers
-ccache -c
+echo "=== 6. Compiling Objects (Ignoring Link Error) ==="
+# Мы используем || true, чтобы скрипт не умер, когда линковка в ninja упадет.
+# Ninja всё равно успеет создать все .o файлы.
+set +e
 ninja -C "$OUTPUT_DIR"
+set -e
 
 echo "=== Finalizing Linkage (Manual Hack for Correct Paths) ==="
 PICO_DIR="builddir-linux/subprojects/picoquic"

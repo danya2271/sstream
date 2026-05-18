@@ -39,12 +39,39 @@ meson setup "$OUTPUT_DIR" \
     -Dwerror=false \
     -Dwarning_level=0 \
     -Dc_args="-I$PROJ_ROOT/subprojects/picotls/include -ffunction-sections -fdata-sections" \
-    -Dc_link_args="-Wl,--gc-sections" \
-    .
+    -Dc_link_args="-Wl,--gc-sections -lcrypto -lssl -ldl"
 
 echo "=== 5. Compiling ==="
+
+ninja -C "$OUTPUT_DIR" subprojects/picoquic/libpicoquic_core.a || true
+
 # Clear ccache to ensure we don't use old failed headers
 ccache -c
 ninja -C "$OUTPUT_DIR"
+
+echo "=== Finalizing Linkage (Manual Hack for Correct Paths) ==="
+PICO_DIR="builddir-linux/subprojects/picoquic"
+
+# Собираем сервер
+g++ -o builddir-linux/slipstream-server \
+    builddir-linux/slipstream-server.p/*.o \
+    $PICO_DIR/libpicoquic_core.a \
+    $PICO_DIR/libpicotls_openssl.a \
+    $PICO_DIR/libpicotls_core.a \
+    $PICO_DIR/libpicotls_fusion.a \
+    $PICO_DIR/libpicotls_minicrypto.a \
+    -lcrypto -lssl -lpthread -ldl -flto -Os -s
+
+# Собираем клиент
+g++ -o builddir-linux/slipstream-client \
+    builddir-linux/slipstream-client.p/*.o \
+    $PICO_DIR/libpicoquic_core.a \
+    $PICO_DIR/libpicotls_openssl.a \
+    $PICO_DIR/libpicotls_core.a \
+    $PICO_DIR/libpicotls_fusion.a \
+    $PICO_DIR/libpicotls_minicrypto.a \
+    -lcrypto -lssl -lpthread -ldl -flto -Os -s
+
+echo "Success! Server size: $(du -h builddir-linux/slipstream-server | cut -f1)"
 
 echo "=== Build complete! ==="

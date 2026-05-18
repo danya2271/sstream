@@ -103,7 +103,7 @@ After=network.target microsocks.service
 
 [Service]
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/$BINARY_NAME --domain "$DOMAIN" --dns-listen-port $SLIP_DNS_PORT --target-address 127.0.0.1:$SOCKS_PORT --cert $INSTALL_DIR/server.crt --key $INSTALL_DIR/server.key --mtu $SLIP_MTU
+ExecStart=$INSTALL_DIR/$BINARY_NAME --domain $DOMAIN --dns-listen-port $SLIP_DNS_PORT --target-address 127.0.0.1:$SOCKS_PORT --cert $INSTALL_DIR/server.crt --key $INSTALL_DIR/server.key --mtu $SLIP_MTU
 Restart=always
 LimitNOFILE=65535
 

@@ -32,11 +32,14 @@ echo "=== 4. Meson Setup ==="
 # We also pass the include path directly into the meson config
 meson setup "$OUTPUT_DIR" \
     --buildtype=release \
+    -Db_lto=true \
+    -Dstrip=true \
     -Ddefault_library=static \
     -Dbuild_loglib=false \
     -Dwerror=false \
     -Dwarning_level=0 \
-    -Dc_args="-I$PROJ_ROOT/subprojects/picotls/include" \
+    -Dc_args="-I$PROJ_ROOT/subprojects/picotls/include -ffunction-sections -fdata-sections" \
+    -Dc_link_args="-Wl,--gc-sections" \
     .
 
 echo "=== 5. Compiling ==="

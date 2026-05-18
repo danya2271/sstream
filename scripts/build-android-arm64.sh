@@ -2,6 +2,8 @@
 # Build script for Android arm64-v8a executable (PIE)
 set -e
 
+export CMAKE=$(which cmake)
+
 ROOT_DIR="$PWD"
 NDK_ROOT="${1:-}"
 API_LEVEL="${2:-26}"

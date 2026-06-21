@@ -6,13 +6,32 @@ project(
   license: 'Apache-2.0',
   meson_version: '>=1.0.0',
   default_options: [
-    'buildtype=debugoptimized',
+    'optimization=s',
+    'debug=false',
+    'b_ndebug=true',
+    'cpp_rtti=false',
+    'strip=true',
     'cpp_std=gnu++11',
     'c_std=gnu11',
     'default_library=shared',
     'warning_level=everything',
-    'b_lto=false',
+    'b_lto=true'
   ],
+)
+
+if host_machine.system() != 'android' and host_machine.system() != 'darwin'
+  add_project_link_arguments('-fuse-ld=mold', language: ['c', 'cpp'])
+endif
+
+# Hide internal symbols and allow aggressive dead-code elimination
+add_project_arguments(
+  '-fvisibility=hidden',
+  '-ffunction-sections',
+  '-fdata-sections',
+  '-fno-unwind-tables',
+  '-fno-asynchronous-unwind-tables',
+  '-fmerge-all-constants',
+  language: ['c', 'cpp']
 )
 
 # Aliases to significant locations in the source tree
@@ -38,12 +57,12 @@ common_sources = files(
 include_dirs = include_directories('include', extern, quick_args, spcdns, lua_resty)
 
 # Default linker arguments
-link_args = []
+link_args = ['-Wl,-s', '-Wl,--icf=all', '-Wl,--hash-style=gnu', '-Wl,--gc-sections']
 
 # Set up static links
 is_static = get_option('default_library') == 'static'
 if is_static and host_machine.system() != 'darwin'
-  link_args = [
+  link_args += [
     '-static-libgcc',
     '-static-libstdc++',
   ]
@@ -58,6 +77,8 @@ picoquic_opts = cmake.subproject_options()
 # Add necessary CMake defines
 picoquic_opts.add_cmake_defines(
   [
+    {'CMAKE_INTERPROCEDURAL_OPTIMIZATION': 'ON'},
+    {'CMAKE_C_FLAGS_RELEASE': '-Os -ffunction-sections -fdata-sections -fvisibility=hidden -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants'},
     {'PICOQUIC_FETCH_PTLS': 'ON'},
     {'BUILD_HTTP': 'OFF'},
     {'ENABLE_ASAN': 'OFF'},

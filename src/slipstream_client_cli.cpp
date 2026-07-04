@@ -1,9 +1,113 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <picosocks.h>
 #include "slipstream.h"
 #include "quick_arg_parser.hpp"
+
+struct ParsedEndpoint {
+    std::string host;
+    int port;
+};
+
+static bool parse_port(const std::string& value, int* port) {
+    if (value.empty()) {
+        return false;
+    }
+
+    char* end = NULL;
+    errno = 0;
+    long parsed = strtol(value.c_str(), &end, 10);
+    if (errno != 0 || *end != '\0' || parsed <= 0 || parsed > 65535) {
+        return false;
+    }
+
+    *port = (int)parsed;
+    return true;
+}
+
+static bool parse_endpoint(const std::string& value, int default_port,
+                           ParsedEndpoint* endpoint, std::string* error) {
+    if (value.empty()) {
+        *error = "empty address";
+        return false;
+    }
+
+    endpoint->port = default_port;
+
+    if (value[0] == '[') {
+        size_t closing = value.find(']');
+        if (closing == std::string::npos) {
+            *error = "missing closing bracket for IPv6 address";
+            return false;
+        }
+        if (closing == 1) {
+            *error = "empty IPv6 address";
+            return false;
+        }
+
+        endpoint->host = value.substr(1, closing - 1);
+        if (closing + 1 == value.size()) {
+            return true;
+        }
+        if (value[closing + 1] != ':') {
+            *error = "unexpected characters after IPv6 address";
+            return false;
+        }
+        if (!parse_port(value.substr(closing + 2), &endpoint->port)) {
+            *error = "invalid port";
+            return false;
+        }
+        return true;
+    }
+
+    size_t first_colon = value.find(':');
+    size_t last_colon = value.rfind(':');
+    if (first_colon != std::string::npos && first_colon == last_colon) {
+        endpoint->host = value.substr(0, first_colon);
+        if (endpoint->host.empty()) {
+            *error = "empty host";
+            return false;
+        }
+        if (!parse_port(value.substr(first_colon + 1), &endpoint->port)) {
+            *error = "invalid port";
+            return false;
+        }
+        return true;
+    }
+
+    endpoint->host = value;
+    return true;
+}
+
+static socklen_t sockaddr_len(const struct sockaddr_storage& addr) {
+    if (addr.ss_family == AF_INET) {
+        return sizeof(struct sockaddr_in);
+    }
+    if (addr.ss_family == AF_INET6) {
+        return sizeof(struct sockaddr_in6);
+    }
+    return sizeof(struct sockaddr_storage);
+}
+
+static std::string format_sockaddr(const struct sockaddr_storage& addr) {
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int ret = getnameinfo((const struct sockaddr*)&addr, sockaddr_len(addr),
+                          host, sizeof(host), service, sizeof(service),
+                          NI_NUMERICHOST | NI_NUMERICSERV);
+    if (ret != 0) {
+        return "unknown";
+    }
+
+    if (addr.ss_family == AF_INET6) {
+        return "[" + std::string(host) + "]:" + std::string(service);
+    }
+    return std::string(host) + ":" + std::string(service);
+}
 
 struct ClientArgs : MainArguments<ClientArgs> {
     using MainArguments<ClientArgs>::MainArguments;
@@ -58,46 +162,29 @@ int main(int argc, char** argv) {
     bool ipv6 = false;
     for (const auto& res_str : args.resolver) {
         st_address_t addr;
-        char server_name[256];
-        int server_port = 53;
-
-        if (res_str[0] == '[') {
-            const char* closing_bracket = strchr(res_str.c_str(), ']');
-            if (closing_bracket != NULL) {
-                size_t addr_len = closing_bracket - (res_str.c_str() + 1);
-                if (addr_len < sizeof(server_name)) {
-                    memcpy(server_name, res_str.c_str() + 1, addr_len);
-                    server_name[addr_len] = '\0';
-                    if (closing_bracket[1] == ':') {
-                        server_port = atoi(closing_bracket + 2);
-                    }
-                    ipv6 = true;
-                } else {
-                    std::cerr << "Invalid IPv6 address in resolver: " << res_str << std::endl;
-                    exit(1);
-                }
-            } else {
-                std::cerr << "Invalid IPv6 address format (missing closing bracket): " << res_str << std::endl;
-                exit(1);
-            }
-        } else {
-            if (sscanf(res_str.c_str(), "%255[^:]:%d", server_name, &server_port) < 1) {
-                strncpy(server_name, res_str.c_str(), sizeof(server_name) - 1);
-                server_name[sizeof(server_name) - 1] = '\0';
-                ipv4 = true;
-            }
-        }
-
-        if (server_port <= 0 || server_port > 65535) {
-            std::cerr << "Invalid port number in resolver address: " << res_str << std::endl;
+        ParsedEndpoint endpoint;
+        std::string error;
+        if (!parse_endpoint(res_str, 53, &endpoint, &error)) {
+            std::cerr << "Invalid resolver address '" << res_str << "': " << error << std::endl;
             exit(1);
         }
 
         int is_name = 0;
-        if (picoquic_get_server_address(server_name, server_port, &addr.server_address, &is_name) != 0) {
-            std::cerr << "Cannot resolve resolver address '" << server_name << "' port " << server_port << std::endl;
+        if (picoquic_get_server_address(endpoint.host.c_str(), endpoint.port, &addr.server_address, &is_name) != 0) {
+            std::cerr << "Cannot resolve resolver address '" << endpoint.host << "' port " << endpoint.port << std::endl;
             exit(1);
         }
+
+        if (addr.server_address.ss_family == AF_INET) {
+            ipv4 = true;
+        } else if (addr.server_address.ss_family == AF_INET6) {
+            ipv6 = true;
+        } else {
+            std::cerr << "Resolver address has unsupported address family: " << res_str << std::endl;
+            exit(1);
+        }
+
+        std::cerr << "Client resolver: " << res_str << " -> " << format_sockaddr(addr.server_address) << std::endl;
         resolver_addresses.push_back(addr);
     }
 

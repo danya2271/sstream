@@ -8,6 +8,7 @@
 #include <autoqlog.h>
 #endif
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <arpa/nameser.h>
 #include <sys/ioctl.h>
@@ -29,6 +30,10 @@
 #include "SPCDNS/src/dns.h"
 #include "SPCDNS/src/mappings.h"
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 volatile sig_atomic_t should_shutdown = 0;
 
 void server_sighandler(int signum) {
@@ -41,6 +46,45 @@ size_t server_domain_name_len = 0;
 char* server_domain_suffix = NULL;
 size_t server_domain_suffix_len = 0;
 bool server_domain_wildcard = false;
+
+static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
+    if (addr->ss_family == AF_INET) {
+        return sizeof(struct sockaddr_in);
+    }
+    if (addr->ss_family == AF_INET6) {
+        return sizeof(struct sockaddr_in6);
+    }
+    return sizeof(struct sockaddr_storage);
+}
+
+static const char* slipstream_format_sockaddr(const struct sockaddr_storage* addr, char* buf, size_t buf_len) {
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int ret = getnameinfo((const struct sockaddr*)addr, slipstream_sockaddr_len(addr),
+                          host, sizeof(host), service, sizeof(service),
+                          NI_NUMERICHOST | NI_NUMERICSERV);
+    if (ret != 0) {
+        snprintf(buf, buf_len, "unknown");
+    } else if (addr->ss_family == AF_INET6) {
+        snprintf(buf, buf_len, "[%s]:%s", host, service);
+    } else {
+        snprintf(buf, buf_len, "%s:%s", host, service);
+    }
+    return buf;
+}
+
+static const char* slipstream_server_event_name(picoquic_call_back_event_t event) {
+    switch (event) {
+    case picoquic_callback_stateless_reset:
+        return "stateless reset";
+    case picoquic_callback_close:
+        return "connection close";
+    case picoquic_callback_application_close:
+        return "application close";
+    default:
+        return "connection event";
+    }
+}
 
 /* --- FIXED: Added ref_count to manage memory safety across threads --- */
 typedef struct st_slipstream_server_stream_ctx_t {
@@ -268,7 +312,12 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
         return NULL;
     }
 
-    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int socket_family = server_ctx->upstream_addr.ss_family;
+    if (socket_family != AF_INET && socket_family != AF_INET6) {
+        socket_family = AF_INET;
+    }
+
+    int sock_fd = socket(socket_family, SOCK_STREAM, 0);
     if (sock_fd < 0) {
         perror("socket() failed");
         close(stream_ctx->pipefd[0]);
@@ -296,6 +345,9 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
         stream_ctx->next_stream->previous_stream = stream_ctx;
         server_ctx->first_stream = stream_ctx;
     }
+
+    fprintf(stderr, "Server stream opened: id=%llu fd=%d\n",
+            (unsigned long long)stream_id, sock_fd);
 
     return stream_ctx;
 }
@@ -511,17 +563,37 @@ void* slipstream_io_copy(void* arg) {
     slipstream_server_ctx_t* server_ctx = args->server_ctx;
     slipstream_server_stream_ctx_t* stream_ctx = args->stream_ctx;
 
-    if (connect(socket, (struct sockaddr*)&server_ctx->upstream_addr, sizeof(server_ctx->upstream_addr)) < 0) {
+    if (connect(socket, (struct sockaddr*)&server_ctx->upstream_addr,
+                slipstream_sockaddr_len(&server_ctx->upstream_addr)) < 0) {
         // Connection failed, close stream
-        // perror("connect() failed");
+        char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
+        fprintf(stderr, "Server upstream connect failed: stream=%llu target=%s error=%s (%d)\n",
+                (unsigned long long)stream_ctx->stream_id,
+                slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
+                strerror(errno), errno);
+        stream_ctx->set_active = 1;
+        int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
+        if (wake_ret != 0) {
+            fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
+                    (unsigned long long)stream_ctx->stream_id, wake_ret);
+        }
         slipstream_stream_release(stream_ctx);
         free(args);
         return NULL;
     }
 
     DBG_PRINTF("[%lu:%d] setup pipe done", stream_ctx->stream_id, stream_ctx->fd);
+    char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
+    fprintf(stderr, "Server upstream connected: stream=%llu target=%s fd=%d\n",
+            (unsigned long long)stream_ctx->stream_id,
+            slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
+            socket);
     stream_ctx->set_active = 1;
     int ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
+    if (ret != 0) {
+        fprintf(stderr, "Server upstream wakeup failed: stream=%llu ret=%d\n",
+                (unsigned long long)stream_ctx->stream_id, ret);
+    }
     DBG_PRINTF("[stream_id=%d][fd=%d] wakeup", stream_ctx->stream_id, socket);
 
     while (1) {
@@ -539,12 +611,19 @@ void* slipstream_io_copy(void* arg) {
         while (remaining > 0) {
             // Write to TCP socket (backend)
             // If socket is closed by main thread, this will fail with EBADF
-            ssize_t bytes_written = send(socket, p, remaining, 0);
+            ssize_t bytes_written = send(socket, p, remaining, MSG_NOSIGNAL);
             if (bytes_written < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
-                // perror("send failed");
+                fprintf(stderr, "Server upstream send failed: stream=%llu error=%s (%d)\n",
+                        (unsigned long long)stream_ctx->stream_id, strerror(errno), errno);
+                stream_ctx->set_active = 1;
+                int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
+                if (wake_ret != 0) {
+                    fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
+                            (unsigned long long)stream_ctx->stream_id, wake_ret);
+                }
                 goto cleanup; // Exit loop on error
             }
             remaining -= bytes_written;
@@ -553,6 +632,8 @@ void* slipstream_io_copy(void* arg) {
     }
 
 cleanup:
+    fprintf(stderr, "Server upstream copy stopped: stream=%llu fd=%d\n",
+            (unsigned long long)stream_ctx->stream_id, socket);
     // Release context reference held by this thread
     slipstream_stream_release(stream_ctx);
     free(args);
@@ -581,6 +662,21 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         server_ctx->next_ctx = d_ctx->next_ctx;
         server_ctx->prev_ctx = d_ctx;
         d_ctx->next_ctx = server_ctx;
+        struct sockaddr* peer_addr = NULL;
+        picoquic_get_peer_addr(cnx, &peer_addr);
+        char peer_text[NI_MAXHOST + NI_MAXSERV + 8];
+        if (peer_addr != NULL) {
+            struct sockaddr_storage peer_storage = {0};
+            if (peer_addr->sa_family == AF_INET) {
+                memcpy(&peer_storage, peer_addr, sizeof(struct sockaddr_in));
+            } else if (peer_addr->sa_family == AF_INET6) {
+                memcpy(&peer_storage, peer_addr, sizeof(struct sockaddr_in6));
+            }
+            fprintf(stderr, "Server QUIC connection created: peer=%s\n",
+                    slipstream_format_sockaddr(&peer_storage, peer_text, sizeof(peer_text)));
+        } else {
+            fprintf(stderr, "Server QUIC connection created: peer=unknown\n");
+        }
     }
 
     switch (fin_or_event) {
@@ -627,6 +723,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             }
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
+            fprintf(stderr, "Server stream finished: id=%llu fd=%d\n",
+                    (unsigned long long)stream_id, stream_ctx == NULL ? -1 : stream_ctx->fd);
             slipstream_server_free_stream_context(server_ctx, stream_ctx);
         }
         break;
@@ -634,6 +732,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         picoquic_reset_stream(cnx, stream_id, 0);
     case picoquic_callback_stream_reset:
         if (stream_ctx != NULL) {
+            fprintf(stderr, "Server stream reset: id=%llu fd=%d\n",
+                    (unsigned long long)stream_id, stream_ctx->fd);
             slipstream_server_free_stream_context(server_ctx, stream_ctx);
             picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
         }
@@ -641,6 +741,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_stateless_reset:
     case picoquic_callback_close:
     case picoquic_callback_application_close: {
+        fprintf(stderr, "Server QUIC %s received\n", slipstream_server_event_name(fin_or_event));
         picoquic_network_thread_ctx_t* thread_ctx = server_ctx == NULL ? NULL : server_ctx->thread_ctx;
         if (server_ctx != NULL) {
             slipstream_server_free_context(server_ctx);
@@ -711,7 +812,10 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         }
         break;
     case picoquic_callback_almost_ready:
+        fprintf(stderr, "Server QUIC connection almost ready\n");
+        break;
     case picoquic_callback_ready:
+        fprintf(stderr, "Server QUIC connection ready\n");
         break;
     default:
         break;
@@ -741,6 +845,14 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     server_domain_wildcard = strncmp(server_domain_name, "*.", 2) == 0;
     server_domain_suffix = server_domain_wildcard ? server_domain_name + 2 : server_domain_name;
     server_domain_suffix_len = strlen(server_domain_suffix);
+
+    char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
+    fprintf(stderr,
+            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d cert=%s key=%s\n",
+            listen_ipv6 ? "[::]" : "0.0.0.0", server_port, domain_name,
+            server_domain_wildcard ? " (wildcard one-label subdomains)" : "",
+            slipstream_format_sockaddr(target_address, upstream_text, sizeof(upstream_text)),
+            mtu, server_cert, server_key);
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
@@ -796,6 +908,9 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     default_context.thread_ctx = &thread_ctx;
 
     signal(SIGTERM, server_sighandler);
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+#endif
     slipstream_packet_loop(&thread_ctx);
     ret = thread_ctx.return_code;
 

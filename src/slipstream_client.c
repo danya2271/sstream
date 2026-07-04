@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <picoquic_internal.h>
 #include <pthread.h>
+#include <signal.h>
 #include <slipstream_sockloop.h>
 #include <stdbool.h>
 #include <arpa/nameser.h>
@@ -25,6 +26,10 @@
 #include "SPCDNS/src/dns.h"
 #include "SPCDNS/src/mappings.h"
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 volatile sig_atomic_t should_shutdown = 0;
 
 void client_sighandler(int signum) {
@@ -33,6 +38,45 @@ void client_sighandler(int signum) {
 }
 
 #define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 50000
+
+static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
+    if (addr->ss_family == AF_INET) {
+        return sizeof(struct sockaddr_in);
+    }
+    if (addr->ss_family == AF_INET6) {
+        return sizeof(struct sockaddr_in6);
+    }
+    return sizeof(struct sockaddr_storage);
+}
+
+static const char* slipstream_format_sockaddr(const struct sockaddr_storage* addr, char* buf, size_t buf_len) {
+    char host[NI_MAXHOST];
+    char service[NI_MAXSERV];
+    int ret = getnameinfo((const struct sockaddr*)addr, slipstream_sockaddr_len(addr),
+                          host, sizeof(host), service, sizeof(service),
+                          NI_NUMERICHOST | NI_NUMERICSERV);
+    if (ret != 0) {
+        snprintf(buf, buf_len, "unknown");
+    } else if (addr->ss_family == AF_INET6) {
+        snprintf(buf, buf_len, "[%s]:%s", host, service);
+    } else {
+        snprintf(buf, buf_len, "%s:%s", host, service);
+    }
+    return buf;
+}
+
+static const char* slipstream_client_event_name(picoquic_call_back_event_t event) {
+    switch (event) {
+    case picoquic_callback_stateless_reset:
+        return "stateless reset";
+    case picoquic_callback_close:
+        return "connection close";
+    case picoquic_callback_application_close:
+        return "application close";
+    default:
+        return "connection event";
+    }
+}
 
 
 typedef struct st_slipstream_client_stream_ctx_t {
@@ -314,8 +358,10 @@ static void slipstream_client_schedule_reconnect(slipstream_client_ctx_t* client
     if (client_ctx->reconnect_delay == 0) {
         client_ctx->reconnect_delay = 1000000;
     }
+    const uint64_t delay = client_ctx->reconnect_delay;
     client_ctx->reconnect_pending = true;
-    client_ctx->reconnect_at = current_time + client_ctx->reconnect_delay;
+    client_ctx->reconnect_at = current_time + delay;
+    fprintf(stderr, "Client reconnect scheduled in %.1f seconds\n", (double)delay / 1000000.0);
     if (client_ctx->reconnect_delay < 30000000) {
         client_ctx->reconnect_delay *= 2;
         if (client_ctx->reconnect_delay > 30000000) {
@@ -343,6 +389,7 @@ static void slipstream_client_connection_lost(slipstream_client_ctx_t* client_ct
         return;
     }
     client_ctx->ready = false;
+    fprintf(stderr, "Client QUIC connection lost\n");
     slipstream_client_schedule_reconnect(client_ctx, picoquic_current_time());
 }
 
@@ -361,6 +408,7 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
     client_ctx->ready = false;
     slipstream_client_reset_paths(client_ctx);
 
+    fprintf(stderr, "Client reconnect attempt starting\n");
     int ret = slipstream_connect(&client_ctx->server_addresses[0].server_address, quic, &cnx, client_ctx);
     if (ret == 0) {
         if (client_ctx->keep_alive_interval != 0) {
@@ -370,10 +418,12 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
         }
         client_ctx->reconnect_pending = false;
         client_ctx->reconnect_delay = 1000000;
+        fprintf(stderr, "Client reconnect attempt started successfully\n");
         return 0;
     }
 
     client_ctx->cnx = NULL;
+    fprintf(stderr, "Client reconnect attempt failed, ret = %d\n", ret);
     slipstream_client_schedule_reconnect(client_ctx, picoquic_current_time());
     return ret;
 }
@@ -390,6 +440,8 @@ void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
             if (stream_ctx->stream_id == -1) {
                 stream_ctx->stream_id = picoquic_get_next_local_stream_id(client_ctx->cnx, 0);
                 DBG_PRINTF("[%lu:%d] assigned stream id", stream_ctx->stream_id, stream_ctx->fd);
+                fprintf(stderr, "Client stream opened: id=%llu fd=%d\n",
+                        (unsigned long long)stream_ctx->stream_id, stream_ctx->fd);
             }
             stream_ctx->set_active = 0;
             DBG_PRINTF("[%lu:%d] activate: stream", stream_ctx->stream_id, stream_ctx->fd);
@@ -415,14 +467,18 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
         //     continue;
         // }
 
-        print_sockaddr_ip_and_port(&slipstream_path->server_address);
+        char addr_text[NI_MAXHOST + NI_MAXSERV + 8];
+        fprintf(stderr, "Client probing resolver path: %s\n",
+                slipstream_format_sockaddr(&slipstream_path->server_address, addr_text, sizeof(addr_text)));
         int path_id = -2;
         picoquic_probe_new_path_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->local_addr, 0, current_time, 0, &path_id);
         if (path_id < 0) {
             DBG_PRINTF("Failed adding path", NULL);
+            fprintf(stderr, "Client resolver path probe failed: %s\n", addr_text);
             continue;
         }
         DBG_PRINTF("Added path", NULL);
+        fprintf(stderr, "Client resolver path added: %s\n", addr_text);
 
         picoquic_reinsert_by_wake_time(cnx->quic, cnx, current_time);
         slipstream_path->added = true;
@@ -625,11 +681,13 @@ void* slipstream_client_accepter(void* arg) {
 
         // Print the connection details
         DBG_PRINTF("Accepted connection from %s:%u on socket %d", client_ip_str, client_port, client_sock);
+        fprintf(stderr, "Client accepted local TCP connection: peer=%s:%u fd=%d\n",
+                client_ip_str, client_port, client_sock);
         // --- End printing section ---
 
         slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);
         if (stream_ctx == NULL) {
-            fprintf(stderr, "Could not initiate stream for %d", client_sock);
+            fprintf(stderr, "Could not initiate stream for %d\n", client_sock);
             break;
         }
 
@@ -708,6 +766,8 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
             DBG_PRINTF("[%lu:%d] fin", stream_id, stream_ctx->fd);
+            fprintf(stderr, "Client stream finished: id=%llu fd=%d\n",
+                    (unsigned long long)stream_id, stream_ctx->fd);
             slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
         }
         break;
@@ -722,6 +782,8 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
         }
         else {
             DBG_PRINTF("[%lu:%d] stream reset", stream_id, stream_ctx->fd);
+            fprintf(stderr, "Client stream reset: id=%llu fd=%d\n",
+                    (unsigned long long)stream_id, stream_ctx->fd);
 
             slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
             picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
@@ -731,6 +793,8 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_close: /* Received connection close */
     case picoquic_callback_application_close: /* Received application close */
         DBG_PRINTF("%s", "Connection closed, reconnecting");
+        fprintf(stderr, "Client QUIC %s received, reconnecting\n",
+                slipstream_client_event_name(fin_or_event));
         slipstream_client_connection_lost(client_ctx);
         break;
     case picoquic_callback_prepare_to_send:
@@ -815,10 +879,10 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
         }
         break;
     case picoquic_callback_almost_ready:
-        fprintf(stderr, "Connection completed, almost ready.\n");
+        fprintf(stderr, "Client QUIC connection completed, almost ready\n");
         break;
     case picoquic_callback_ready:
-        fprintf(stderr, "Connection confirmed.\n");
+        fprintf(stderr, "Client QUIC connection confirmed\n");
         client_ctx->ready = true;
         slipstream_add_paths(client_ctx);
         slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
@@ -849,22 +913,14 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 
     *cnx = NULL;
 
-    char host[NI_MAXHOST];
-    socklen_t addrlen = sizeof(*server_address);
-    ret = getnameinfo((struct sockaddr*)server_address, addrlen,
-                      host, sizeof(host),
-                      NULL, 0,
-                      NI_NUMERICHOST | NI_NUMERICSERV);
-    if (ret != 0) {
-        fprintf(stderr, "Could not get name info for server address\n");
-        return -1;
-    }
+    char remote_text[NI_MAXHOST + NI_MAXSERV + 8];
 
     /* Initialize the callback context and create the connection context.
      * We use minimal options on the client side, keeping the transport
      * parameter values set by default for picoquic. This could be fixed later.
      */
-    fprintf(stderr, "Starting connection to %s\n", host);
+    fprintf(stderr, "Client QUIC connecting: resolver=%s\n",
+            slipstream_format_sockaddr(server_address, remote_text, sizeof(remote_text)));
 
     /* Create a client connection */
     *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
@@ -897,13 +953,11 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
     /* Printing out the initial CID, which is used to identify log files */
     picoquic_connection_id_t icid = picoquic_get_initial_cnxid(*cnx);
     DBG_PRINTF("%s", "Initial connection ID follows");
-#ifndef DISABLE_DEBUG_PRINTF
-    fprintf(stderr, "Initial connection ID: ");
+    fprintf(stderr, "Client QUIC initial cid: ");
     for (uint8_t i = 0; i < icid.id_len; i++) {
         fprintf(stderr, "%02x", icid.id[i]);
     }
     fprintf(stderr, "\n");
-#endif
 
     return ret;
 }
@@ -938,6 +992,11 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.disable_port_blocking = 1;
     config.enable_sslkeylog = getenv("SSLKEYLOGFILE") != NULL;
     config.alpn = SLIPSTREAM_ALPN;
+
+    fprintf(stderr,
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d cc=%s gso=%s keepalive=%zu\n",
+            listen_port, domain_name, server_address_count, mtu, cc_algo_id,
+            gso ? "on" : "off", keep_alive_interval);
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();
@@ -1003,7 +1062,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         exit(EXIT_FAILURE);
     }
 
-    fprintf(stderr, "Listening on port %d...\n", listen_port);
+    fprintf(stderr, "Client listening on tcp 0.0.0.0:%d\n", listen_port);
 
     picoquic_packet_loop_param_t param = {0};
     param.local_af = client_ctx.server_addresses[0].server_address.ss_family;
@@ -1044,6 +1103,9 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     }
 
     signal(SIGTERM, client_sighandler);
+#ifdef SIGPIPE
+    signal(SIGPIPE, SIG_IGN);
+#endif
     // picoquic_packet_loop_v3(&thread_ctx);
     slipstream_packet_loop(&thread_ctx);
     ret = thread_ctx.return_code;

@@ -327,9 +327,7 @@ static void slipstream_client_connection_lost(slipstream_client_ctx_t* client_ct
         return;
     }
     client_ctx->ready = false;
-    client_ctx->reconnect_delay = 1000000;
-    client_ctx->reconnect_pending = true;
-    client_ctx->reconnect_at = picoquic_current_time();
+    slipstream_client_schedule_reconnect(client_ctx, picoquic_current_time());
 }
 
 static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx) {

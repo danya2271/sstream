@@ -14,6 +14,7 @@
 #include <sys/param.h>
 #include <sys/poll.h>
 #include <assert.h>
+#include <strings.h>
 #include <picoquic_internal.h>
 #include <slipstream_sockloop.h>
 
@@ -37,6 +38,9 @@ void server_sighandler(int signum) {
 
 char* server_domain_name = NULL;
 size_t server_domain_name_len = 0;
+char* server_domain_suffix = NULL;
+size_t server_domain_suffix_len = 0;
+bool server_domain_wildcard = false;
 
 /* --- FIXED: Added ref_count to manage memory safety across threads --- */
 typedef struct st_slipstream_server_stream_ctx_t {
@@ -145,6 +149,40 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     return packet_len;
 }
 
+static ssize_t slipstream_server_encoded_prefix_len(const char* qname) {
+    size_t q_len = strlen(qname);
+    size_t q_end = q_len;
+    if (q_end > 0 && qname[q_end - 1] == '.') {
+        q_end--;
+    }
+
+    if (server_domain_suffix == NULL || q_end < server_domain_suffix_len + 2) {
+        return -1;
+    }
+
+    const size_t suffix_start = q_end - server_domain_suffix_len;
+    if (suffix_start == 0 || qname[suffix_start - 1] != '.' ||
+        strncasecmp(qname + suffix_start, server_domain_suffix, server_domain_suffix_len) != 0) {
+        return -1;
+    }
+
+    if (!server_domain_wildcard) {
+        return (ssize_t)(suffix_start - 1);
+    }
+
+    const size_t dot_before_suffix = suffix_start - 1;
+    size_t wildcard_start = dot_before_suffix;
+    while (wildcard_start > 0 && qname[wildcard_start - 1] != '.') {
+        wildcard_start--;
+    }
+
+    if (wildcard_start == 0 || wildcard_start == dot_before_suffix) {
+        return -1;
+    }
+
+    return (ssize_t)(wildcard_start - 1);
+}
+
 ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, struct sockaddr_storage *peer_addr, struct sockaddr_storage *local_addr) {
     *dest_buf = NULL;
     slot_t* slot = slot_p;
@@ -187,13 +225,7 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
         return 0;
     }
 
-    size_t q_len = strlen(question->name);
-    if (q_len < server_domain_name_len + 2) {
-        slot->error = RCODE_NAME_ERROR;
-        return 0;
-    }
-
-    const ssize_t data_len = q_len - server_domain_name_len - 2;
+    const ssize_t data_len = slipstream_server_encoded_prefix_len(question->name);
     if (data_len <= 0) {
         slot->error = RCODE_NAME_ERROR;
         return 0;
@@ -699,8 +731,16 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
 
     memcpy(&default_context.upstream_addr, target_address, sizeof(struct sockaddr_storage));
 
+    if (strncmp(domain_name, "*.", 2) == 0 && domain_name[2] == '\0') {
+        fprintf(stderr, "Wildcard domain must include a suffix, for example *.meowda.space\n");
+        return -1;
+    }
+
     server_domain_name = strdup(domain_name);
     server_domain_name_len = strlen(domain_name);
+    server_domain_wildcard = strncmp(server_domain_name, "*.", 2) == 0;
+    server_domain_suffix = server_domain_wildcard ? server_domain_name + 2 : server_domain_name;
+    server_domain_suffix_len = strlen(server_domain_suffix);
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);

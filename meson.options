@@ -1,6 +1,12 @@
 # Enable picoquic-log
 option('build_loglib', type : 'boolean', value : false)
 
+# Prefer static OpenSSL libraries when configuring the picoquic CMake subproject.
+option('static_openssl', type : 'boolean', value : false)
+
+# Optional OpenSSL installation prefix for CMake's FindOpenSSL.
+option('openssl_root_dir', type : 'string', value : '')
+
 # Android NDK root path
 option('android_ndk_root', type : 'string', value : '')
 
@@ -15,4 +21,3 @@ option('android_buildtype', type : 'string', value : 'release')
 
 # Android default library
 option('android_default_library', type : 'string', value : 'static')
-

@@ -70,23 +70,45 @@ endif
 
 # Import the CMake module
 cmake = import('cmake')
+fs = import('fs')
 
 # Get the cmake options objects
 picoquic_opts = cmake.subproject_options()
 
 # Add necessary CMake defines
+picotls_source_dir = meson.project_source_root() / 'subprojects' / 'picoquic' / 'picotls'
+picoquic_release_c_flags = '-Os -ffunction-sections -fdata-sections -fvisibility=hidden -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants'
+picoquic_cmake_defines = [
+  {'CMAKE_INTERPROCEDURAL_OPTIMIZATION': 'ON'},
+  {'PICOQUIC_FETCH_PTLS': 'ON'},
+  {'BUILD_HTTP': 'OFF'},
+  {'ENABLE_ASAN': 'OFF'},
+  {'ENABLE_UBSAN': 'OFF'},
+  {'CMAKE_POLICY_VERSION_MINIMUM': '3.5'},
+  {'BUILD_DEMO': 'OFF'},
+  {'BUILD_TESTING': 'OFF'},
+]
+
+if fs.exists(picotls_source_dir / 'CMakeLists.txt') and fs.exists(picotls_source_dir / 'deps' / 'picotest' / 'picotest.c')
+  picotls_include_arg = '-I' + (picotls_source_dir / 'include')
+  picoquic_cmake_defines += [{'CMAKE_C_FLAGS': picotls_include_arg}]
+  picoquic_release_c_flags += ' ' + picotls_include_arg
+  picoquic_cmake_defines += [{'FETCHCONTENT_SOURCE_DIR_PICOTLS': picotls_source_dir}]
+endif
+
+picoquic_cmake_defines += [{'CMAKE_C_FLAGS_RELEASE': picoquic_release_c_flags}]
+
+if get_option('static_openssl')
+  picoquic_cmake_defines += [{'OPENSSL_USE_STATIC_LIBS': 'TRUE'}]
+endif
+
+openssl_root_dir = get_option('openssl_root_dir')
+if openssl_root_dir != ''
+  picoquic_cmake_defines += [{'OPENSSL_ROOT_DIR': openssl_root_dir}]
+endif
+
 picoquic_opts.add_cmake_defines(
-  [
-    {'CMAKE_INTERPROCEDURAL_OPTIMIZATION': 'ON'},
-    {'CMAKE_C_FLAGS_RELEASE': '-Os -ffunction-sections -fdata-sections -fvisibility=hidden -fno-unwind-tables -fno-asynchronous-unwind-tables -fmerge-all-constants'},
-    {'PICOQUIC_FETCH_PTLS': 'ON'},
-    {'BUILD_HTTP': 'OFF'},
-    {'ENABLE_ASAN': 'OFF'},
-    {'ENABLE_UBSAN': 'OFF'},
-    {'CMAKE_POLICY_VERSION_MINIMUM': '3.5'},
-    {'BUILD_DEMO': 'OFF'},
-    {'BUILD_TESTING': 'OFF'},
-  ],
+  picoquic_cmake_defines,
 )
 # Configure picoquic debug printing
 if get_option('buildtype').startswith('debug')

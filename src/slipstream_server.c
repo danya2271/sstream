@@ -380,7 +380,38 @@ typedef struct st_slipstream_server_poller_args {
     slipstream_server_stream_ctx_t* stream_ctx;
 } slipstream_server_poller_args;
 
-void* slipstream_server_poller(void* arg) {
+static void* slipstream_server_poller(void* arg);
+
+static void slipstream_server_arm_poller(picoquic_cnx_t* cnx,
+                                         slipstream_server_ctx_t* server_ctx,
+                                         slipstream_server_stream_ctx_t* stream_ctx) {
+    if (!__sync_bool_compare_and_swap(&stream_ctx->poller_active, 0, 1)) {
+        return;
+    }
+
+    slipstream_server_poller_args* args = malloc(sizeof(slipstream_server_poller_args));
+    if (args == NULL) {
+        __sync_lock_release(&stream_ctx->poller_active);
+        return;
+    }
+    args->fd = stream_ctx->fd;
+    args->cnx = cnx;
+    args->server_ctx = server_ctx;
+    args->stream_ctx = stream_ctx;
+
+    slipstream_stream_retain(stream_ctx);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, slipstream_server_poller, args) != 0) {
+        free(args);
+        slipstream_stream_release(stream_ctx);
+        __sync_lock_release(&stream_ctx->poller_active);
+        return;
+    }
+
+    pthread_detach(thread);
+}
+
+static void* slipstream_server_poller(void* arg) {
     slipstream_server_poller_args* args = arg;
     slipstream_server_stream_ctx_t* stream_ctx = args->stream_ctx;
 
@@ -599,45 +630,24 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             }
             ret = 0;
 
-            int length_to_read = MIN(length, length_available);
+            size_t length_to_read = MIN((size_t)length, (size_t)length_available);
             if (length_to_read == 0) {
                 char a;
                 errno = 0;
                 ssize_t bytes_read = recv(stream_ctx->fd, &a, 1, MSG_PEEK | MSG_DONTWAIT);
                 if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
-
-                    if (__sync_bool_compare_and_swap(&stream_ctx->poller_active, 0, 1)) {
-                        slipstream_server_poller_args* args = malloc(sizeof(slipstream_server_poller_args));
-                        if (args == NULL) {
-                            __sync_lock_release(&stream_ctx->poller_active);
-                            break;
-                        }
-                        args->fd = stream_ctx->fd;
-                        args->cnx = cnx;
-                        args->server_ctx = server_ctx;
-                        args->stream_ctx = stream_ctx;
-
-                        // Retain for poller thread
-                        slipstream_stream_retain(stream_ctx);
-
-                        pthread_t thread;
-                        if (pthread_create(&thread, NULL, slipstream_server_poller, args) != 0) {
-                            free(args);
-                            slipstream_stream_release(stream_ctx);
-                            __sync_lock_release(&stream_ctx->poller_active);
-                        } else {
-                            pthread_detach(thread);
-                        }
-                    }
+                    slipstream_server_arm_poller(cnx, server_ctx, stream_ctx);
+                    return 0;
                 }
                 if (bytes_read == 0) {
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
                 }
                 if (bytes_read > 0) {
-                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 1);
-                    break;
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                    picoquic_mark_active_stream(cnx, stream_id, 1, stream_ctx);
+                    return 0;
                 }
                 if (bytes_read < 0) {
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
@@ -645,18 +655,27 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                 return 0;
             }
 
-            uint8_t* buffer = picoquic_provide_stream_data_buffer(bytes, length_to_read, 0, 1);
-            if (buffer == NULL) break;
-
-            ssize_t bytes_read = recv(stream_ctx->fd, buffer, length_to_read, MSG_DONTWAIT);
+            uint8_t stack_buffer[PICOQUIC_MAX_PACKET_SIZE];
+            if (length_to_read > sizeof(stack_buffer)) {
+                length_to_read = sizeof(stack_buffer);
+            }
+            ssize_t bytes_read = recv(stream_ctx->fd, stack_buffer, length_to_read, MSG_DONTWAIT);
             if (bytes_read == 0) {
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                 return 0;
             }
             if (bytes_read < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                    slipstream_server_arm_poller(cnx, server_ctx, stream_ctx);
+                    return 0;
+                }
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }
+            uint8_t* buffer = picoquic_provide_stream_data_buffer(bytes, (size_t)bytes_read, 0, 1);
+            if (buffer == NULL) break;
+            memcpy(buffer, stack_buffer, (size_t)bytes_read);
         }
         break;
     case picoquic_callback_almost_ready:

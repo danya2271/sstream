@@ -234,7 +234,7 @@ slipstream_client_stream_ctx_t* slipstream_client_create_stream_ctx(picoquic_cnx
     slipstream_client_stream_ctx_t* stream_ctx = malloc(sizeof(slipstream_client_stream_ctx_t));
 
     if (stream_ctx == NULL) {
-        fprintf(stdout, "Memory Error, cannot create stream for sock %d\n", sock_fd);
+        fprintf(stderr, "Memory Error, cannot create stream for sock %d\n", sock_fd);
         return NULL;
     }
 
@@ -373,10 +373,10 @@ void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
         if (stream_ctx->set_active && stream_ctx->fd != -1) {
             if (stream_ctx->stream_id == -1) {
                 stream_ctx->stream_id = picoquic_get_next_local_stream_id(client_ctx->cnx, 0);
-                printf("[%lu:%d] assigned stream id\n", stream_ctx->stream_id, stream_ctx->fd);
+                DBG_PRINTF("[%lu:%d] assigned stream id", stream_ctx->stream_id, stream_ctx->fd);
             }
             stream_ctx->set_active = 0;
-            printf("[%lu:%d] activate: stream\n", stream_ctx->stream_id, stream_ctx->fd);
+            DBG_PRINTF("[%lu:%d] activate: stream", stream_ctx->stream_id, stream_ctx->fd);
             picoquic_mark_active_stream(client_ctx->cnx, stream_ctx->stream_id, 1, stream_ctx);
         }
         stream_ctx = stream_ctx->next_stream;
@@ -492,7 +492,44 @@ typedef struct st_slipstream_client_poller_args {
     slipstream_client_stream_ctx_t* stream_ctx;
 } slipstream_client_poller_args;
 
-void* slipstream_client_poller(void* arg) {
+static void* slipstream_client_poller(void* arg);
+
+static void slipstream_client_arm_poller(picoquic_cnx_t* cnx,
+                                         slipstream_client_ctx_t* client_ctx,
+                                         slipstream_client_stream_ctx_t* stream_ctx) {
+    if (!__sync_bool_compare_and_swap(&stream_ctx->poller_active, 0, 1)) {
+        return;
+    }
+
+    slipstream_client_poller_args* args = malloc(sizeof(slipstream_client_poller_args));
+    if (args == NULL) {
+        __sync_lock_release(&stream_ctx->poller_active);
+        return;
+    }
+    args->fd = stream_ctx->fd;
+    args->cnx = cnx;
+    args->client_ctx = client_ctx;
+    args->stream_ctx = stream_ctx;
+
+    slipstream_client_stream_retain(stream_ctx);
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, slipstream_client_poller, args) != 0) {
+        perror("pthread_create() failed for client poller");
+        slipstream_client_stream_release(stream_ctx);
+        __sync_lock_release(&stream_ctx->poller_active);
+        free(args);
+        return;
+    }
+
+#ifdef __APPLE__
+    pthread_setname_np("slipstream_client_poller");
+#else
+    pthread_setname_np(thread, "slipstream_client_poller");
+#endif
+    pthread_detach(thread);
+}
+
+static void* slipstream_client_poller(void* arg) {
     slipstream_client_poller_args* args = arg;
     slipstream_client_stream_ctx_t* stream_ctx = args->stream_ctx;
 
@@ -520,7 +557,7 @@ void* slipstream_client_poller(void* arg) {
         if (ret != 0) {
             fprintf(stderr, "poll: could not wake up network thread, ret = %d\n", ret);
         }
-        printf("[%lu:%d] wakeup\n", stream_ctx->stream_id, args->fd);
+        DBG_PRINTF("[%lu:%d] wakeup", stream_ctx->stream_id, args->fd);
 
         break;
     }
@@ -549,7 +586,6 @@ void* slipstream_client_accepter(void* arg) {
         int client_sock = accept(args->fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_sock < 0) {
             if (errno == EINTR) {
-                fprintf(stderr, "my ass?");
                 continue;
             }
             perror("accept() failed");
@@ -569,7 +605,7 @@ void* slipstream_client_accepter(void* arg) {
         uint16_t client_port = ntohs(client_addr.sin_port);
 
         // Print the connection details
-        fprintf(stderr, "Accepted connection from %s:%u on socket %d\n", client_ip_str, client_port, client_sock);
+        DBG_PRINTF("Accepted connection from %s:%u on socket %d", client_ip_str, client_port, client_sock);
         // --- End printing section ---
 
         slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);
@@ -586,7 +622,7 @@ void* slipstream_client_accepter(void* arg) {
             pthread_exit(NULL);
         }
 
-        printf("[%lu:%d] accept: connection\n[%lu:%d] wakeup\n", stream_ctx->stream_id, client_sock,  stream_ctx->stream_id, client_sock);
+        DBG_PRINTF("[%lu:%d] accept: connection and wakeup", stream_ctx->stream_id, client_sock);
     }
 
     free(args);
@@ -637,7 +673,7 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
             if (slipstream_client_send_all(stream_ctx->fd, bytes, length) != 0) {
                 if (errno == EPIPE) {
                     /* Connection closed */
-                    printf("[%lu:%d] send: closed stream\n", stream_id, stream_ctx->fd);
+                    DBG_PRINTF("[%lu:%d] send: closed stream", stream_id, stream_ctx->fd);
 
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
@@ -646,13 +682,13 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                     /* TODO: this is bad because we don't have a way to backpressure */
                 }
 
-                printf("[%lu:%d] send: error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
+                fprintf(stderr, "[%lu:%d] send: error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
-            printf("[%lu:%d] fin\n", stream_id, stream_ctx->fd);
+            DBG_PRINTF("[%lu:%d] fin", stream_id, stream_ctx->fd);
             slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
         }
         break;
@@ -666,7 +702,7 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
              * connection. */
         }
         else {
-            printf("[%lu:%d] stream reset\n", stream_id, stream_ctx->fd);
+            DBG_PRINTF("[%lu:%d] stream reset", stream_id, stream_ctx->fd);
 
             slipstream_client_free_stream_ctx(client_ctx, stream_ctx);
             picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
@@ -675,7 +711,7 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_stateless_reset:
     case picoquic_callback_close: /* Received connection close */
     case picoquic_callback_application_close: /* Received application close */
-        printf("Connection closed, reconnecting.\n");
+        DBG_PRINTF("%s", "Connection closed, reconnecting");
         slipstream_client_connection_lost(client_ctx);
         break;
     case picoquic_callback_prepare_to_send:
@@ -691,14 +727,14 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
             ret = ioctl(stream_ctx->fd, FIONREAD, &length_available);
             // printf("[%lu:%d] recv->quic_send (available %d)\n", stream_id, stream_ctx->fd, length_available);
             if (ret < 0) {
-                printf("[%lu:%d] ioctl error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
+                fprintf(stderr, "[%lu:%d] ioctl error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
                 /* TODO: why would it return an error? */
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 break;
             }
             ret = 0;
 
-            int length_to_read = MIN(length, length_available);
+            size_t length_to_read = MIN((size_t)length, (size_t)length_available);
             if (length_to_read == 0) {
                 char a;
                 errno = 0;
@@ -708,79 +744,62 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
                     // printf("[%lu:%d] recv->quic_send empty errno set: %s\n", stream_id, stream_ctx->fd, strerror(errno));
                     /* No bytes available, wait for next event */
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
-                    printf("[%lu:%d] recv->quic_send: empty, disactivate\n\n", stream_id, stream_ctx->fd);
-
-                    if (__sync_bool_compare_and_swap(&stream_ctx->poller_active, 0, 1)) {
-                        slipstream_client_poller_args* args = malloc(sizeof(slipstream_client_poller_args));
-                        if (args == NULL) {
-                            __sync_lock_release(&stream_ctx->poller_active);
-                            break;
-                        }
-                        args->fd = stream_ctx->fd;
-                        args->cnx = cnx;
-                        args->client_ctx = client_ctx;
-                        args->stream_ctx = stream_ctx;
-
-                        slipstream_client_stream_retain(stream_ctx);
-                        pthread_t thread;
-                        if (pthread_create(&thread, NULL, slipstream_client_poller, args) != 0) {
-                            perror("pthread_create() failed for thread1");
-                            slipstream_client_stream_release(stream_ctx);
-                            __sync_lock_release(&stream_ctx->poller_active);
-                            free(args);
-                        } else {
-#ifdef __APPLE__
-                            pthread_setname_np("slipstream_client_poller");
-#else
-                            pthread_setname_np(thread, "slipstream_client_poller");
-#endif
-                            pthread_detach(thread);
-                        }
-                    }
+                    DBG_PRINTF("[%lu:%d] recv->quic_send: empty, disactivate", stream_id, stream_ctx->fd);
+                    slipstream_client_arm_poller(cnx, client_ctx, stream_ctx);
+                    return 0;
                 }
                 if (bytes_read == 0) {
-                    printf("[%lu:%d] recv: closed stream\n", stream_id, stream_ctx->fd);
+                    DBG_PRINTF("[%lu:%d] recv: closed stream", stream_id, stream_ctx->fd);
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
                 }
                 if (bytes_read > 0) {
-                    /* send it in next loop iteration */
-                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 1);
-                    break;
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                    picoquic_mark_active_stream(cnx, stream_id, 1, stream_ctx);
+                    return 0;
                 }
                 if (bytes_read < 0) {
-                    printf("[%lu:%d] recv: error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
+                    fprintf(stderr, "[%lu:%d] recv: error: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 }
                 return 0;
             }
 
-            uint8_t* buffer = picoquic_provide_stream_data_buffer(bytes, length_to_read, 0, 1);
-            if (buffer == NULL) {
-                /* Should never happen according to callback spec. */
-                break;
-            }
             // printf("[%lu:%d] recv->quic_send recv %d bytes into quic\n", stream_id, stream_ctx->fd, length_to_read);
-            ssize_t bytes_read = recv(stream_ctx->fd, buffer, length_to_read, MSG_DONTWAIT);
+            uint8_t stack_buffer[PICOQUIC_MAX_PACKET_SIZE];
+            if (length_to_read > sizeof(stack_buffer)) {
+                length_to_read = sizeof(stack_buffer);
+            }
+            ssize_t bytes_read = recv(stream_ctx->fd, stack_buffer, length_to_read, MSG_DONTWAIT);
             // printf("[%lu:%d] recv->quic_send recv done %d bytes into quic\n", stream_id, stream_ctx->fd, bytes_read);
             if (bytes_read == 0) {
-                printf("Closed connection on sock %d on recv", stream_ctx->fd);
+                DBG_PRINTF("Closed connection on sock %d on recv", stream_ctx->fd);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                 return 0;
             }
             if (bytes_read < 0) {
-                fprintf(stderr, "recv: %s (%d)\n", strerror(errno), errno);
-                /* There should be bytes available, so a return value of 0 is an error */
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
+                    slipstream_client_arm_poller(cnx, client_ctx, stream_ctx);
+                    return 0;
+                }
+                fprintf(stderr, "[%lu:%d] recv: %s (%d)\n", stream_id, stream_ctx->fd, strerror(errno), errno);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }
+            uint8_t* buffer = picoquic_provide_stream_data_buffer(bytes, (size_t)bytes_read, 0, 1);
+            if (buffer == NULL) {
+                /* Should never happen according to callback spec. */
+                break;
+            }
+            memcpy(buffer, stack_buffer, (size_t)bytes_read);
         }
         break;
     case picoquic_callback_almost_ready:
-        fprintf(stdout, "Connection completed, almost ready.\n");
+        fprintf(stderr, "Connection completed, almost ready.\n");
         break;
     case picoquic_callback_ready:
-        fprintf(stdout, "Connection confirmed.\n");
+        fprintf(stderr, "Connection confirmed.\n");
         client_ctx->ready = true;
         slipstream_add_paths(client_ctx);
     default:
@@ -815,7 +834,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
      * We use minimal options on the client side, keeping the transport
      * parameter values set by default for picoquic. This could be fixed later.
      */
-    printf("Starting connection to %s\n", host);
+    fprintf(stderr, "Starting connection to %s\n", host);
 
     /* Create a client connection */
     *cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
@@ -847,11 +866,14 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
 
     /* Printing out the initial CID, which is used to identify log files */
     picoquic_connection_id_t icid = picoquic_get_initial_cnxid(*cnx);
-    printf("Initial connection ID: ");
+    DBG_PRINTF("%s", "Initial connection ID follows");
+#ifndef DISABLE_DEBUG_PRINTF
+    fprintf(stderr, "Initial connection ID: ");
     for (uint8_t i = 0; i < icid.id_len; i++) {
-        printf("%02x", icid.id[i]);
+        fprintf(stderr, "%02x", icid.id[i]);
     }
-    printf("\n");
+    fprintf(stderr, "\n");
+#endif
 
     return ret;
 }
@@ -951,7 +973,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         exit(EXIT_FAILURE);
     }
 
-    printf("Listening on port %d...\n", listen_port);
+    fprintf(stderr, "Listening on port %d...\n", listen_port);
 
     picoquic_packet_loop_param_t param = {0};
     param.local_af = client_ctx.server_addresses[0].server_address.ss_family;
@@ -997,7 +1019,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     ret = thread_ctx.return_code;
 
     /* And finish. */
-    printf("Client exit, ret = %d\n", ret);
+    fprintf(stderr, "Client exit, ret = %d\n", ret);
 
     picoquic_free(quic);
 

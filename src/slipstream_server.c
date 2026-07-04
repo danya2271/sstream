@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <errno.h>
 #include <picoquic.h>
 #include <picoquic_packet_loop.h>
 #include <picosocks.h>
@@ -45,6 +46,7 @@ typedef struct st_slipstream_server_stream_ctx_t {
     int pipefd[2];
     uint64_t stream_id;
     volatile sig_atomic_t set_active;
+    volatile int poller_active;
     int ref_count; /* Reference counter for thread safety */
 } slipstream_server_stream_ctx_t;
 
@@ -133,7 +135,7 @@ ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     if (rc != RCODE_OKAY) {
         free(packet);
         DBG_PRINTF("dns_encode() = (%d) %s", rc, dns_rcode_text(rc));
-        return EXIT_FAILURE;
+        return -1;
     }
     *dest_buf = (unsigned char*)packet;
 
@@ -162,7 +164,8 @@ ssize_t server_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     const dns_rcode_t rc = dns_decode(packet, &packet_len, (const dns_packet_t*) src_buf, src_buf_len);
     if (rc != RCODE_OKAY) {
         DBG_PRINTF("dns_decode() = (%d) %s", rc, dns_rcode_text(rc));
-        return -1;
+        slot->error = RCODE_FORMAT_ERROR;
+        return 0;
     }
 
     const dns_query_t *query = (dns_query_t*) packet;
@@ -280,6 +283,11 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
         server_ctx->first_stream = stream_ctx->next_stream;
     }
 
+    if (server_ctx->cnx != NULL && stream_ctx->stream_id != UINT64_MAX) {
+        picoquic_unlink_app_stream_ctx(server_ctx->cnx, stream_ctx->stream_id);
+        stream_ctx->stream_id = UINT64_MAX;
+    }
+
     // 2. Close FDs immediately to interrupt any blocking calls in threads
     if (stream_ctx->fd != -1) {
         close(stream_ctx->fd);
@@ -391,7 +399,9 @@ void* slipstream_server_poller(void* arg) {
         }
         if (ret == 0) continue;
 
-        stream_ctx->set_active = 1;
+        if (stream_ctx->fd != -1) {
+            stream_ctx->set_active = 1;
+        }
         ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
         if (ret != 0) {
             DBG_PRINTF("poll: could not wake up network thread, ret = %d", ret);
@@ -400,6 +410,7 @@ void* slipstream_server_poller(void* arg) {
     }
 
     // Release context reference held by this thread
+    __sync_lock_release(&stream_ctx->poller_active);
     slipstream_stream_release(stream_ctx);
     free(args);
     pthread_exit(NULL);
@@ -412,6 +423,22 @@ typedef struct st_slipstream_io_copy_args {
     slipstream_server_ctx_t* server_ctx;
     slipstream_server_stream_ctx_t* stream_ctx;
 } slipstream_io_copy_args;
+
+static int slipstream_write_all(int fd, const uint8_t* bytes, size_t length) {
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t bytes_written = write(fd, bytes + offset, length - offset);
+        if (bytes_written > 0) {
+            offset += (size_t)bytes_written;
+            continue;
+        }
+        if (bytes_written < 0 && errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
 
 void* slipstream_io_copy(void* arg) {
     char buffer[65535];
@@ -451,6 +478,9 @@ void* slipstream_io_copy(void* arg) {
             // If socket is closed by main thread, this will fail with EBADF
             ssize_t bytes_written = send(socket, p, remaining, 0);
             if (bytes_written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
                 // perror("send failed");
                 goto cleanup; // Exit loop on error
             }
@@ -496,7 +526,9 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         if (stream_ctx == NULL) {
             stream_ctx = slipstream_server_create_stream_ctx(server_ctx, stream_id);
             if (stream_ctx == NULL || picoquic_set_app_stream_ctx(cnx, stream_id, stream_ctx) != 0) {
-                if(stream_ctx) free(stream_ctx);
+                if (stream_ctx != NULL) {
+                    slipstream_server_free_stream_context(server_ctx, stream_ctx);
+                }
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }
@@ -524,8 +556,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         if (length > 0) {
             // Check if pipe is still valid
             if (stream_ctx->pipefd[1] != -1) {
-                ssize_t bytes_sent = write(stream_ctx->pipefd[1], bytes, length);
-                if (bytes_sent < 0) {
+                if (slipstream_write_all(stream_ctx->pipefd[1], bytes, length) != 0) {
                     // Pipe broken
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
@@ -533,9 +564,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             }
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
-            /* Close local sock */
-            if (stream_ctx->fd != -1) { close(stream_ctx->fd); stream_ctx->fd = -1; }
-            picoquic_unlink_app_stream_ctx(cnx, stream_id);
+            slipstream_server_free_stream_context(server_ctx, stream_ctx);
         }
         break;
     case picoquic_callback_stop_sending:
@@ -548,14 +577,18 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         break;
     case picoquic_callback_stateless_reset:
     case picoquic_callback_close:
-    case picoquic_callback_application_close:
+    case picoquic_callback_application_close: {
+        picoquic_network_thread_ctx_t* thread_ctx = server_ctx == NULL ? NULL : server_ctx->thread_ctx;
         if (server_ctx != NULL) {
             slipstream_server_free_context(server_ctx);
         }
         picoquic_set_callback(cnx, NULL, NULL);
         picoquic_close(cnx, 0);
-        picoquic_wake_up_network_thread(server_ctx->thread_ctx);
+        if (thread_ctx != NULL) {
+            picoquic_wake_up_network_thread(thread_ctx);
+        }
         break;
+    }
     case picoquic_callback_prepare_to_send:
         if (stream_ctx != NULL && stream_ctx->fd != -1) {
             int length_available;
@@ -569,25 +602,33 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             int length_to_read = MIN(length, length_available);
             if (length_to_read == 0) {
                 char a;
+                errno = 0;
                 ssize_t bytes_read = recv(stream_ctx->fd, &a, 1, MSG_PEEK | MSG_DONTWAIT);
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (bytes_read < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
 
-                    slipstream_server_poller_args* args = malloc(sizeof(slipstream_server_poller_args));
-                    args->fd = stream_ctx->fd;
-                    args->cnx = cnx;
-                    args->server_ctx = server_ctx;
-                    args->stream_ctx = stream_ctx;
+                    if (__sync_bool_compare_and_swap(&stream_ctx->poller_active, 0, 1)) {
+                        slipstream_server_poller_args* args = malloc(sizeof(slipstream_server_poller_args));
+                        if (args == NULL) {
+                            __sync_lock_release(&stream_ctx->poller_active);
+                            break;
+                        }
+                        args->fd = stream_ctx->fd;
+                        args->cnx = cnx;
+                        args->server_ctx = server_ctx;
+                        args->stream_ctx = stream_ctx;
 
-                    // Retain for poller thread
-                    slipstream_stream_retain(stream_ctx);
+                        // Retain for poller thread
+                        slipstream_stream_retain(stream_ctx);
 
-                    pthread_t thread;
-                    if (pthread_create(&thread, NULL, slipstream_server_poller, args) != 0) {
-                        free(args);
-                        slipstream_stream_release(stream_ctx);
-                    } else {
-                        pthread_detach(thread);
+                        pthread_t thread;
+                        if (pthread_create(&thread, NULL, slipstream_server_poller, args) != 0) {
+                            free(args);
+                            slipstream_stream_release(stream_ctx);
+                            __sync_lock_release(&stream_ctx->poller_active);
+                        } else {
+                            pthread_detach(thread);
+                        }
                     }
                 }
                 if (bytes_read == 0) {
@@ -597,6 +638,9 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                 if (bytes_read > 0) {
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 1);
                     break;
+                }
+                if (bytes_read < 0) {
+                    (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 }
                 return 0;
             }
@@ -648,10 +692,10 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     config.initial_send_mtu_ipv4 = mtu;
     config.initial_send_mtu_ipv6 = mtu;
     config.multipath_option = 1;
-    config.use_long_log = 1;
+    config.use_long_log = 0;
     config.do_preemptive_repeat = 1;
     config.disable_port_blocking = 1;
-    config.enable_sslkeylog = 1;
+    config.enable_sslkeylog = getenv("SSLKEYLOGFILE") != NULL;
     config.alpn = SLIPSTREAM_ALPN;
 
     current_time = picoquic_current_time();

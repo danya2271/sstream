@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -49,6 +50,22 @@ static int udp_gso_available = 1;
 static int udp_gso_available = 0;
 #endif
 
+static int slipstream_is_transient_send_error(int sock_err) {
+    switch (sock_err) {
+    case EINTR:
+    case EAGAIN:
+#if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+    case ENOBUFS:
+    case ECONNREFUSED:
+    case EHOSTUNREACH:
+    case ENETUNREACH:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_socket_ctx_t* s_ctx) {
     picoquic_quic_t* quic = thread_ctx->quic;
@@ -138,6 +155,9 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             }
 
             if (bytes_recv == 0) {
+                if (!param->is_client) {
+                    nb_slots_written--;
+                }
                 continue;
             }
 
@@ -236,9 +256,12 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             free(encoded);
             if (bytes_sent == 0) {
                 DBG_PRINTF("BYTES_SENT == 0 %d\n", bytes_sent);
-                return -1;
+                continue;
             }
             if (bytes_sent < 0) {
+                if (slipstream_is_transient_send_error(sock_err == 0 ? errno : sock_err)) {
+                    continue;
+                }
                 return bytes_sent;
             }
 
@@ -307,9 +330,12 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             free(encoded);
             if (bytes_sent == 0) {
                 DBG_PRINTF("BYTES_SENT == 0 %d\n", bytes_sent);
-                return -1;
+                continue;
             }
             if (bytes_sent < 0) {
+                if (slipstream_is_transient_send_error(sock_err == 0 ? errno : sock_err)) {
+                    continue;
+                }
                 return bytes_sent;
             }
 

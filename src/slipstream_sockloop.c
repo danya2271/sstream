@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -24,6 +25,8 @@
 #endif
 
 #include <pthread.h>
+
+extern volatile sig_atomic_t should_shutdown;
 
 #ifndef SOCKET_TYPE
 #define SOCKET_TYPE int
@@ -126,6 +129,12 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             int bytes_recv = picoquic_packet_loop_select(s_ctx, 1, &peer_addr, &local_addr, &if_index_to, &received_ecn,
                 buffer, buffer_size, delta_t, &is_wake_up_event, thread_ctx, &socket_rank);
             if (bytes_recv < 0) {
+                if (errno == EINTR) {
+                    if (should_shutdown) {
+                        return 0;
+                    }
+                    continue;
+                }
                 /* The interrupt error is expected if the loop is closing. */
                 return thread_ctx->thread_should_close ? PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP : -1;
             }

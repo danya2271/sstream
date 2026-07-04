@@ -534,6 +534,7 @@ static void* slipstream_server_poller(void* arg) {
 typedef struct st_slipstream_io_copy_args {
     int pipe;
     int socket;
+    uint64_t stream_id;
     picoquic_cnx_t* cnx;
     slipstream_server_ctx_t* server_ctx;
     slipstream_server_stream_ctx_t* stream_ctx;
@@ -560,6 +561,7 @@ void* slipstream_io_copy(void* arg) {
     slipstream_io_copy_args* args = arg;
     int pipe = args->pipe;
     int socket = args->socket;
+    uint64_t stream_id = args->stream_id;
     slipstream_server_ctx_t* server_ctx = args->server_ctx;
     slipstream_server_stream_ctx_t* stream_ctx = args->stream_ctx;
 
@@ -568,14 +570,14 @@ void* slipstream_io_copy(void* arg) {
         // Connection failed, close stream
         char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
         fprintf(stderr, "Server upstream connect failed: stream=%llu target=%s error=%s (%d)\n",
-                (unsigned long long)stream_ctx->stream_id,
+                (unsigned long long)stream_id,
                 slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
                 strerror(errno), errno);
         stream_ctx->set_active = 1;
         int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
         if (wake_ret != 0) {
             fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
-                    (unsigned long long)stream_ctx->stream_id, wake_ret);
+                    (unsigned long long)stream_id, wake_ret);
         }
         slipstream_stream_release(stream_ctx);
         free(args);
@@ -585,14 +587,14 @@ void* slipstream_io_copy(void* arg) {
     DBG_PRINTF("[%lu:%d] setup pipe done", stream_ctx->stream_id, stream_ctx->fd);
     char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
     fprintf(stderr, "Server upstream connected: stream=%llu target=%s fd=%d\n",
-            (unsigned long long)stream_ctx->stream_id,
+            (unsigned long long)stream_id,
             slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
             socket);
     stream_ctx->set_active = 1;
     int ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
     if (ret != 0) {
         fprintf(stderr, "Server upstream wakeup failed: stream=%llu ret=%d\n",
-                (unsigned long long)stream_ctx->stream_id, ret);
+                (unsigned long long)stream_id, ret);
     }
     DBG_PRINTF("[stream_id=%d][fd=%d] wakeup", stream_ctx->stream_id, socket);
 
@@ -617,12 +619,12 @@ void* slipstream_io_copy(void* arg) {
                     continue;
                 }
                 fprintf(stderr, "Server upstream send failed: stream=%llu error=%s (%d)\n",
-                        (unsigned long long)stream_ctx->stream_id, strerror(errno), errno);
+                        (unsigned long long)stream_id, strerror(errno), errno);
                 stream_ctx->set_active = 1;
                 int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
                 if (wake_ret != 0) {
                     fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
-                            (unsigned long long)stream_ctx->stream_id, wake_ret);
+                            (unsigned long long)stream_id, wake_ret);
                 }
                 goto cleanup; // Exit loop on error
             }
@@ -633,7 +635,7 @@ void* slipstream_io_copy(void* arg) {
 
 cleanup:
     fprintf(stderr, "Server upstream copy stopped: stream=%llu fd=%d\n",
-            (unsigned long long)stream_ctx->stream_id, socket);
+            (unsigned long long)stream_id, socket);
     // Release context reference held by this thread
     slipstream_stream_release(stream_ctx);
     free(args);
@@ -695,6 +697,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             slipstream_io_copy_args* args = malloc(sizeof(slipstream_io_copy_args));
             args->pipe = stream_ctx->pipefd[0];
             args->socket = stream_ctx->fd;
+            args->stream_id = stream_ctx->stream_id;
             args->cnx = cnx;
             args->server_ctx = server_ctx;
             args->stream_ctx = stream_ctx;

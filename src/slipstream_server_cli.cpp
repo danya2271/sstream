@@ -72,8 +72,8 @@ int main(int argc, char** argv) {
 
     exit_code = picoquic_slipstream_server(
         args.listen_port,
-        args.mtu,
         args.listen_ipv6,
+        args.mtu,
         (char*)args.cert.c_str(),
         (char*)args.key.c_str(),
         &target_address,

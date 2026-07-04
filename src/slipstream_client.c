@@ -32,6 +32,8 @@ void client_sighandler(int signum) {
     should_shutdown = 1;
 }
 
+#define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 50000
+
 
 typedef struct st_slipstream_client_stream_ctx_t {
     struct st_slipstream_client_stream_ctx_t* next_stream;
@@ -322,6 +324,20 @@ static void slipstream_client_schedule_reconnect(slipstream_client_ctx_t* client
     }
 }
 
+static void slipstream_client_schedule_active_poll(slipstream_client_ctx_t* client_ctx, uint64_t current_time) {
+    if (!client_ctx->ready || client_ctx->cnx == NULL || client_ctx->first_stream == NULL) {
+        if (client_ctx->cnx != NULL) {
+            picoquic_set_app_wake_time(client_ctx->cnx, 0);
+        }
+        return;
+    }
+
+    const uint64_t next_poll = current_time + SLIPSTREAM_ACTIVE_POLL_INTERVAL_US;
+    if (client_ctx->cnx->app_wake_time == 0 || client_ctx->cnx->app_wake_time > next_poll) {
+        picoquic_set_app_wake_time(client_ctx->cnx, next_poll);
+    }
+}
+
 static void slipstream_client_connection_lost(slipstream_client_ctx_t* client_ctx) {
     if (should_shutdown || client_ctx->reconnect_pending) {
         return;
@@ -378,6 +394,7 @@ void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
             stream_ctx->set_active = 0;
             DBG_PRINTF("[%lu:%d] activate: stream", stream_ctx->stream_id, stream_ctx->fd);
             picoquic_mark_active_stream(client_ctx->cnx, stream_ctx->stream_id, 1, stream_ctx);
+            slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
         }
         stream_ctx = stream_ctx->next_stream;
     }
@@ -460,6 +477,7 @@ int slipstream_client_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_l
             slipstream_add_paths(client_ctx);
         }
         slipstream_client_mark_active_pass(client_ctx);
+        slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
 
         break;
     case picoquic_packet_loop_wake_up:
@@ -468,6 +486,7 @@ int slipstream_client_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_l
         }
 
         slipstream_client_mark_active_pass(client_ctx);
+        slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
 
         break;
     case picoquic_packet_loop_after_send:
@@ -802,6 +821,17 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
         fprintf(stderr, "Connection confirmed.\n");
         client_ctx->ready = true;
         slipstream_add_paths(client_ctx);
+        slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
+        break;
+    case picoquic_callback_app_wakeup:
+        if (client_ctx->ready && client_ctx->first_stream != NULL) {
+            cnx->is_poll_requested = 1;
+            slipstream_client_schedule_active_poll(client_ctx, stream_id);
+        }
+        else {
+            picoquic_set_app_wake_time(cnx, 0);
+        }
+        break;
     default:
         /* unexpected -- just ignore. */
         break;

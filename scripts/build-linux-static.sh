@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 OUTPUT_DIR="${OUTPUT_DIR:-builddir-linux}"
-STATIC_OPENSSL="${STATIC_OPENSSL:-1}"
+STATIC_OPENSSL="${STATIC_OPENSSL:-auto}"
 OPENSSL_STATIC_PREFIX="${OPENSSL_STATIC_PREFIX:-}"
 
 die() {
@@ -98,6 +98,20 @@ meson_args=(
     -Dc_args="$common_c_args"
     -Dcpp_args="$common_c_args"
 )
+
+if [ "$STATIC_OPENSSL" != "auto" ] && [ "$STATIC_OPENSSL" != "1" ] && [ "$STATIC_OPENSSL" != "0" ]; then
+    die "STATIC_OPENSSL must be auto, 1, or 0"
+fi
+
+if [ "$STATIC_OPENSSL" = "auto" ]; then
+    if openssl_prefix=$(find_static_openssl_prefix); then
+        STATIC_OPENSSL=1
+    else
+        STATIC_OPENSSL=0
+        echo "=== Static OpenSSL libraries not found; falling back to dynamic OpenSSL ==="
+        echo "=== Set STATIC_OPENSSL=1 to require a fully static OpenSSL build ==="
+    fi
+fi
 
 if [ "$STATIC_OPENSSL" = "1" ]; then
     openssl_prefix=$(find_static_openssl_prefix) || die "static OpenSSL libraries were not found. Install the OpenSSL static development package or set OPENSSL_STATIC_PREFIX=/path/to/openssl. To build with dynamic OpenSSL, run STATIC_OPENSSL=0 $0"

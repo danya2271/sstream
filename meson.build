@@ -34,6 +34,10 @@ add_project_arguments(
   language: ['c', 'cpp']
 )
 
+if not get_option('buildtype').startswith('debug')
+  add_project_arguments('-DDISABLE_DEBUG_PRINTF', language: ['c', 'cpp'])
+endif
+
 # Aliases to significant locations in the source tree
 src = 'src'
 extern = 'extern'

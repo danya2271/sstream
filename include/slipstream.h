@@ -15,6 +15,7 @@ extern "C" {
 #define SLIPSTREAM_FILE_CANCEL_ERROR 0x105
 
 #define SLIPSTREAM_QLOG_DIR "./qlog";
+#define SLIPSTREAM_SERVER_MTU_MAX 1190
 #include <stdbool.h>
 
 typedef struct st_address_t {

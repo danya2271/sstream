@@ -9,7 +9,7 @@ struct ServerArgs : MainArguments<ServerArgs> {
     using MainArguments<ServerArgs>::MainArguments;
 
     int listen_port = option("dns-listen-port", 'l', "DNS listen port (default: 53)") = 53;
-    int mtu = option("mtu", 'm', "Mtu size") = 1500;
+    int mtu = option("mtu", 'm', "Mtu size") = SLIPSTREAM_SERVER_MTU_MAX;
     std::string target_address = option("target-address", 'a', "Target server address (default: 127.0.0.1:5201)") = "127.0.0.1:5201";
     std::string cert = option("cert", 'c', "Certificate file path (default: certs/cert.pem)") = "certs/cert.pem";
     bool listen_ipv6 = option("dns-listen-ipv6", '6', "DNS listen on IPv6 (default: false)") = false;

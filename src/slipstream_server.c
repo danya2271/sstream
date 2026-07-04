@@ -673,6 +673,10 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     int ret = 0;
     uint64_t current_time = 0;
     slipstream_server_ctx_t default_context = {0};
+    if (mtu > SLIPSTREAM_SERVER_MTU_MAX) {
+        fprintf(stderr, "Server MTU %d is too large for DNS TXT responses; using %d\n", mtu, SLIPSTREAM_SERVER_MTU_MAX);
+        mtu = SLIPSTREAM_SERVER_MTU_MAX;
+    }
 
     memcpy(&default_context.upstream_addr, target_address, sizeof(struct sockaddr_storage));
 

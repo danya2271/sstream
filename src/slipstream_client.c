@@ -1163,6 +1163,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.mtu_max = mtu;
     config.initial_send_mtu_ipv4 = mtu;
     config.initial_send_mtu_ipv6 = mtu;
+    config.cnx_id_length = SLIPSTREAM_CONNECTION_ID_LEN;
     config.cc_algo_id = cc_algo_id;
     config.multipath_option = 1;
     config.use_long_log = 0;
@@ -1172,10 +1173,11 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.alpn = SLIPSTREAM_ALPN;
 
     fprintf(stderr,
-            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu packed-query-payload=%zu packed-queries=%s cc=%s gso=%s keepalive=%zu\n",
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d cid-len=%d dns-query-payload=%zu packed-query-payload=%zu packed-queries=%s cc=%s gso=%s keepalive=%zu\n",
             listen_port, domain_name, server_address_count, mtu, client_query_payload_budget,
-            client_packed_query_payload_budget, client_packed_queries_allowed ? "on" : "off", cc_algo_id,
-            gso ? "on" : "off", keep_alive_interval);
+            SLIPSTREAM_CONNECTION_ID_LEN, client_packed_query_payload_budget,
+            client_packed_queries_allowed ? "on" : "off", cc_algo_id, gso ? "on" : "off",
+            keep_alive_interval);
 
     /* Create the QUIC context for the server */
     current_time = picoquic_current_time();

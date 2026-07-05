@@ -942,11 +942,12 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
 
     char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
     fprintf(stderr,
-            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d packed-queries=%s cert=%s key=%s\n",
+            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d cid-len=%d packed-queries=%s cert=%s key=%s\n",
             listen_ipv6 ? "[::]" : "0.0.0.0", server_port, domain_name,
             server_domain_wildcard ? " (wildcard one-label subdomains)" : "",
             slipstream_format_sockaddr(target_address, upstream_text, sizeof(upstream_text)),
-            mtu, server_packed_queries_enabled ? "on" : "off", server_cert, server_key);
+            mtu, SLIPSTREAM_CONNECTION_ID_LEN, server_packed_queries_enabled ? "on" : "off",
+            server_cert, server_key);
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
@@ -960,6 +961,7 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     config.mtu_max = mtu;
     config.initial_send_mtu_ipv4 = mtu;
     config.initial_send_mtu_ipv6 = mtu;
+    config.cnx_id_length = SLIPSTREAM_CONNECTION_ID_LEN;
     config.multipath_option = 1;
     config.use_long_log = 0;
     config.do_preemptive_repeat = 1;

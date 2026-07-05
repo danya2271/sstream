@@ -164,7 +164,8 @@ int slipstream_packet_loop_(picoquic_network_thread_ctx_t* thread_ctx, picoquic_
             }
 
             if (bytes_recv == 0) {
-                if (!param->is_client) {
+                if (!param->is_client &&
+                    (slot->error == RCODE_OKAY || slot->error == RCODE_FORMAT_ERROR)) {
                     nb_slots_written--;
                 }
                 continue;

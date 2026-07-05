@@ -130,11 +130,16 @@ typedef struct st_slipstream_client_ctx_t {
     size_t keep_alive_interval;
     uint64_t reconnect_at;
     uint64_t reconnect_delay;
+    uint8_t control_match_pos;
+    bool packed_queries_enabled;
 } slipstream_client_ctx_t;
 
 char* client_domain_name = NULL;
 size_t client_domain_name_len = 0;
+static size_t client_legacy_query_payload_budget = 0;
+static size_t client_packed_query_payload_budget = 0;
 static size_t client_query_payload_budget = 0;
+static size_t client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
 
 #define SLIPSTREAM_DNS_NAME_BUFSIZE 255
 
@@ -142,14 +147,21 @@ static size_t slipstream_base32_encoded_len(size_t raw_len) {
     return (raw_len * 8 + 4) / 5;
 }
 
-static size_t slipstream_dotified_encoded_len(size_t encoded_len) {
+static size_t slipstream_dotified_encoded_len(size_t encoded_len, size_t label_max) {
     if (encoded_len == 0) {
         return 0;
     }
-    return encoded_len + (encoded_len - 1) / SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+    return encoded_len + (encoded_len - 1) / label_max;
 }
 
-static size_t slipstream_client_query_payload_budget(size_t domain_len) {
+static size_t slipstream_client_legacy_query_budget(size_t domain_len) {
+    if (domain_len >= 240) {
+        return 0;
+    }
+    return ((240 - domain_len) * 5) / 8;
+}
+
+static size_t slipstream_client_packed_query_budget(size_t domain_len) {
     const size_t suffix_len = domain_len + 2; /* dot before domain plus final root dot */
     if (suffix_len >= SLIPSTREAM_DNS_NAME_BUFSIZE) {
         return 0;
@@ -159,7 +171,7 @@ static size_t slipstream_client_query_payload_budget(size_t domain_len) {
     size_t payload = (max_dotified_len * 5) / 8;
     while (payload > 0) {
         const size_t encoded_len = slipstream_base32_encoded_len(payload);
-        if (slipstream_dotified_encoded_len(encoded_len) <= max_dotified_len) {
+        if (slipstream_dotified_encoded_len(encoded_len, SLIPSTREAM_DNS_ENCODED_LABEL_MAX) <= max_dotified_len) {
             return payload;
         }
         payload--;
@@ -172,6 +184,60 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
                               picoquic_quic_t* quic, picoquic_cnx_t** cnx,
                               slipstream_client_ctx_t* client_ctx);
 
+static void slipstream_client_use_legacy_queries(slipstream_client_ctx_t* client_ctx) {
+    client_ctx->packed_queries_enabled = false;
+    client_ctx->control_match_pos = 0;
+    client_query_payload_budget = client_legacy_query_payload_budget;
+    client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
+}
+
+static void slipstream_client_enable_packed_queries(picoquic_cnx_t* cnx, slipstream_client_ctx_t* client_ctx) {
+    if (client_ctx->packed_queries_enabled || client_packed_query_payload_budget <= client_legacy_query_payload_budget) {
+        return;
+    }
+
+    client_ctx->packed_queries_enabled = true;
+    client_query_payload_budget = client_packed_query_payload_budget;
+    client_query_label_max = SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+
+    picoquic_quic_t* quic = picoquic_get_quic_ctx(cnx);
+    picoquic_set_mtu_max(quic, (uint32_t)client_packed_query_payload_budget);
+    picoquic_set_initial_send_mtu(quic, (uint32_t)client_packed_query_payload_budget,
+                                  (uint32_t)client_packed_query_payload_budget);
+
+    for (int i = 0; i < cnx->nb_paths; i++) {
+        if (cnx->path[i] != NULL && cnx->path[i]->send_mtu < client_packed_query_payload_budget) {
+            cnx->path[i]->send_mtu = client_packed_query_payload_budget;
+            cnx->path[i]->send_mtu_max_tried = client_packed_query_payload_budget;
+            cnx->path[i]->mtu_probe_sent = 0;
+        }
+    }
+
+    fprintf(stderr, "Client packed DNS queries enabled: payload=%zu label=%zu\n",
+            client_query_payload_budget, client_query_label_max);
+}
+
+static void slipstream_client_process_control_stream(picoquic_cnx_t* cnx,
+                                                     slipstream_client_ctx_t* client_ctx,
+                                                     const uint8_t* bytes,
+                                                     size_t length) {
+    const char* magic = SLIPSTREAM_QUERY_PACK_CONTROL;
+    const size_t magic_len = sizeof(SLIPSTREAM_QUERY_PACK_CONTROL) - 1;
+
+    for (size_t i = 0; i < length; i++) {
+        if (bytes[i] == (uint8_t)magic[client_ctx->control_match_pos]) {
+            client_ctx->control_match_pos++;
+            if (client_ctx->control_match_pos == magic_len) {
+                client_ctx->control_match_pos = 0;
+                slipstream_client_enable_packed_queries(cnx, client_ctx);
+                return;
+            }
+        } else {
+            client_ctx->control_match_pos = bytes[i] == (uint8_t)magic[0] ? 1 : 0;
+        }
+    }
+}
+
 ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const unsigned char* src_buf, size_t src_buf_len) {
     char name[SLIPSTREAM_DNS_NAME_BUFSIZE];
     if (src_buf_len > client_query_payload_budget) {
@@ -180,7 +246,7 @@ ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const un
     }
 
     const size_t len = b32_encode(&name[0], (const char*) src_buf, src_buf_len, true, false);
-    const size_t encoded_len = slipstream_inline_dotify(name, sizeof(name), len);
+    const size_t encoded_len = slipstream_inline_dotify_label_max(name, sizeof(name), len, client_query_label_max);
     if (encoded_len == (size_t)-1) {
         DBG_PRINTF("could not dotify query payload: encoded_len=%zu", len);
         return -1;
@@ -477,6 +543,7 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
 
     client_ctx->ready = false;
     slipstream_client_reset_paths(client_ctx);
+    slipstream_client_use_legacy_queries(client_ctx);
 
     fprintf(stderr, "Client reconnect attempt starting\n");
     int ret = slipstream_connect(&client_ctx->server_addresses[0].server_address, quic, &cnx, client_ctx);
@@ -814,6 +881,9 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_stream_fin:
         /* Data arrival on stream #x, maybe with fin mark */
         if (stream_ctx == NULL) {
+            if ((stream_id & 3) == 3 && length > 0) {
+                slipstream_client_process_control_stream(cnx, client_ctx, bytes, length);
+            }
             /* This is unexpected, as all contexts were declared when initializing the
              * connection. */
             return 0;
@@ -1061,14 +1131,18 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
-    client_query_payload_budget = slipstream_client_query_payload_budget(client_domain_name_len);
-    if (client_query_payload_budget == 0 || client_query_payload_budget > INT_MAX) {
+    client_legacy_query_payload_budget = slipstream_client_legacy_query_budget(client_domain_name_len);
+    client_packed_query_payload_budget = slipstream_client_packed_query_budget(client_domain_name_len);
+    if (client_legacy_query_payload_budget == 0 || client_legacy_query_payload_budget > INT_MAX ||
+        client_packed_query_payload_budget == 0 || client_packed_query_payload_budget > INT_MAX) {
         fprintf(stderr, "Domain name is too long for slipstream DNS query encoding: %s\n", domain_name);
         free(client_domain_name);
         client_domain_name = NULL;
         client_domain_name_len = 0;
         return -1;
     }
+    client_query_payload_budget = client_legacy_query_payload_budget;
+    client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
     int mtu = (int)client_query_payload_budget;
 
     /* Create config */
@@ -1091,8 +1165,9 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.alpn = SLIPSTREAM_ALPN;
 
     fprintf(stderr,
-            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu cc=%s gso=%s keepalive=%zu\n",
-            listen_port, domain_name, server_address_count, mtu, client_query_payload_budget, cc_algo_id,
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu packed-query-payload=%zu cc=%s gso=%s keepalive=%zu\n",
+            listen_port, domain_name, server_address_count, mtu, client_query_payload_budget,
+            client_packed_query_payload_budget, cc_algo_id,
             gso ? "on" : "off", keep_alive_interval);
 
     /* Create the QUIC context for the server */

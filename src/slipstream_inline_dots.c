@@ -1,12 +1,15 @@
 #include "slipstream_inline_dots.h"
 
-size_t slipstream_inline_dotify(char * __restrict__ buf, size_t buflen, size_t len) {
+size_t slipstream_inline_dotify_label_max(char * __restrict__ buf, size_t buflen, size_t len, size_t label_max) {
     if (len == 0) { // If there's nothing to do, we do nothing. Efficient, right?
         if (buflen > 0) buf[0] = '\0';
         return 0;
     }
+    if (label_max == 0) {
+        return (size_t)-1;
+    }
 
-    size_t dots = (len - 1) / SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+    size_t dots = (len - 1) / label_max;
     size_t new_len = len + dots;
 
     if (new_len + 1 > buflen) {
@@ -19,7 +22,7 @@ size_t slipstream_inline_dotify(char * __restrict__ buf, size_t buflen, size_t l
     char *dst = buf + new_len - 1;      // Points to where last char will end up
 
     // Anchor the next dot securely based on expected dot count
-    size_t next_dot = dots * SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+    size_t next_dot = dots * label_max;
 
     size_t current_pos = len;
 
@@ -27,7 +30,7 @@ size_t slipstream_inline_dotify(char * __restrict__ buf, size_t buflen, size_t l
     while (current_pos > 0) {
         if (current_pos == next_dot && next_dot != 0) {
             *dst-- = '.';               // Dot. Because rules are rules, even for dots.
-            next_dot -= SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+            next_dot -= label_max;
             current_pos--;              // Account for the char space the dot took.
             continue;                   // Skip the copy for this iteration, already placed dot.
         }
@@ -36,6 +39,10 @@ size_t slipstream_inline_dotify(char * __restrict__ buf, size_t buflen, size_t l
     }
 
     return new_len;
+}
+
+size_t slipstream_inline_dotify(char * __restrict__ buf, size_t buflen, size_t len) {
+    return slipstream_inline_dotify_label_max(buf, buflen, len, SLIPSTREAM_DNS_ENCODED_LABEL_MAX);
 }
 
 size_t slipstream_inline_undotify(char * __restrict__ buf, size_t len) {

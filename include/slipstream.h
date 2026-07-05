@@ -9,6 +9,7 @@ extern "C" {
 
 #define SLIPSTREAM_ALPN "picoquic_sample"
 #define SLIPSTREAM_SNI "test.example.com"
+#define SLIPSTREAM_QUERY_PACK_CONTROL "SSQP1"
 
 #define SLIPSTREAM_NO_ERROR 0
 #define SLIPSTREAM_INTERNAL_ERROR 0x101

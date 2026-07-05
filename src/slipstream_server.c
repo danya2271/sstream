@@ -120,6 +120,12 @@ typedef struct st_slipstream_server_ctx_t {
     struct st_slipstream_server_ctx_t* next_ctx;
 } slipstream_server_ctx_t;
 
+static void slipstream_server_send_query_pack_capability(picoquic_cnx_t* cnx) {
+    const uint8_t control[] = SLIPSTREAM_QUERY_PACK_CONTROL;
+    const uint64_t stream_id = picoquic_get_next_local_stream_id(cnx, 1);
+    (void)picoquic_add_to_stream(cnx, stream_id, control, sizeof(control) - 1, 1);
+}
+
 /* Helper to retain context (increment ref count) */
 void slipstream_stream_retain(slipstream_server_stream_ctx_t* ctx) {
     __sync_add_and_fetch(&ctx->ref_count, 1);
@@ -898,6 +904,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         break;
     case picoquic_callback_ready:
         fprintf(stderr, "Server QUIC connection ready\n");
+        slipstream_server_send_query_pack_capability(cnx);
         break;
     default:
         break;

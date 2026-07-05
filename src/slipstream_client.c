@@ -8,6 +8,7 @@
 #include <autoqlog.h>
 #endif
 #include <assert.h>
+#include <limits.h>
 #include <picoquic_internal.h>
 #include <pthread.h>
 #include <signal.h>
@@ -133,15 +134,57 @@ typedef struct st_slipstream_client_ctx_t {
 
 char* client_domain_name = NULL;
 size_t client_domain_name_len = 0;
+static size_t client_query_payload_budget = 0;
+
+#define SLIPSTREAM_DNS_NAME_BUFSIZE 255
+
+static size_t slipstream_base32_encoded_len(size_t raw_len) {
+    return (raw_len * 8 + 4) / 5;
+}
+
+static size_t slipstream_dotified_encoded_len(size_t encoded_len) {
+    if (encoded_len == 0) {
+        return 0;
+    }
+    return encoded_len + (encoded_len - 1) / SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
+}
+
+static size_t slipstream_client_query_payload_budget(size_t domain_len) {
+    const size_t suffix_len = domain_len + 2; /* dot before domain plus final root dot */
+    if (suffix_len >= SLIPSTREAM_DNS_NAME_BUFSIZE) {
+        return 0;
+    }
+
+    const size_t max_dotified_len = (SLIPSTREAM_DNS_NAME_BUFSIZE - 1) - suffix_len;
+    size_t payload = (max_dotified_len * 5) / 8;
+    while (payload > 0) {
+        const size_t encoded_len = slipstream_base32_encoded_len(payload);
+        if (slipstream_dotified_encoded_len(encoded_len) <= max_dotified_len) {
+            return payload;
+        }
+        payload--;
+    }
+
+    return 0;
+}
 
 static int slipstream_connect(struct sockaddr_storage* server_address,
                               picoquic_quic_t* quic, picoquic_cnx_t** cnx,
                               slipstream_client_ctx_t* client_ctx);
 
 ssize_t client_encode_segment(dns_packet_t* packet, size_t* packet_len, const unsigned char* src_buf, size_t src_buf_len) {
-    char name[255];
+    char name[SLIPSTREAM_DNS_NAME_BUFSIZE];
+    if (src_buf_len > client_query_payload_budget) {
+        DBG_PRINTF("query payload too large: %zu > %zu", src_buf_len, client_query_payload_budget);
+        return -1;
+    }
+
     const size_t len = b32_encode(&name[0], (const char*) src_buf, src_buf_len, true, false);
-    const size_t encoded_len = slipstream_inline_dotify(name, 255, len);
+    const size_t encoded_len = slipstream_inline_dotify(name, sizeof(name), len);
+    if (encoded_len == (size_t)-1) {
+        DBG_PRINTF("could not dotify query payload: encoded_len=%zu", len);
+        return -1;
+    }
     name[encoded_len] = '.';
 
     memcpy(&name[encoded_len + 1], client_domain_name, client_domain_name_len);
@@ -1018,10 +1061,15 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
-
-    double mtu_d = 240 - (double) client_domain_name_len;
-    mtu_d = mtu_d / 1.6;
-    int mtu = (int) mtu_d;
+    client_query_payload_budget = slipstream_client_query_payload_budget(client_domain_name_len);
+    if (client_query_payload_budget == 0 || client_query_payload_budget > INT_MAX) {
+        fprintf(stderr, "Domain name is too long for slipstream DNS query encoding: %s\n", domain_name);
+        free(client_domain_name);
+        client_domain_name = NULL;
+        client_domain_name_len = 0;
+        return -1;
+    }
+    int mtu = (int)client_query_payload_budget;
 
     /* Create config */
     picoquic_quic_config_t config;
@@ -1043,8 +1091,8 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.alpn = SLIPSTREAM_ALPN;
 
     fprintf(stderr,
-            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d cc=%s gso=%s keepalive=%zu\n",
-            listen_port, domain_name, server_address_count, mtu, cc_algo_id,
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu cc=%s gso=%s keepalive=%zu\n",
+            listen_port, domain_name, server_address_count, mtu, client_query_payload_budget, cc_algo_id,
             gso ? "on" : "off", keep_alive_interval);
 
     /* Create the QUIC context for the server */

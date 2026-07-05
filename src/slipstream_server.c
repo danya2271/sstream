@@ -720,6 +720,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             if (stream_ctx->pipefd[1] != -1) {
                 if (slipstream_write_all(stream_ctx->pipefd[1], bytes, length) != 0) {
                     // Pipe broken
+                    fprintf(stderr, "Server stream pipe write failed: id=%llu fd=%d error=%s (%d)\n",
+                            (unsigned long long)stream_id, stream_ctx->fd, strerror(errno), errno);
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
                 }
@@ -777,6 +779,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                     return 0;
                 }
                 if (bytes_read == 0) {
+                    fprintf(stderr, "Server upstream closed connection: stream=%llu fd=%d\n",
+                            (unsigned long long)stream_id, stream_ctx->fd);
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
                 }
@@ -786,6 +790,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                     return 0;
                 }
                 if (bytes_read < 0) {
+                    fprintf(stderr, "Server upstream peek failed: stream=%llu fd=%d error=%s (%d)\n",
+                            (unsigned long long)stream_id, stream_ctx->fd, strerror(errno), errno);
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 }
                 return 0;
@@ -797,6 +803,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             }
             ssize_t bytes_read = recv(stream_ctx->fd, stack_buffer, length_to_read, MSG_DONTWAIT);
             if (bytes_read == 0) {
+                fprintf(stderr, "Server upstream closed while reading: stream=%llu fd=%d\n",
+                        (unsigned long long)stream_id, stream_ctx->fd);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                 return 0;
             }
@@ -806,6 +814,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                     slipstream_server_arm_poller(cnx, server_ctx, stream_ctx);
                     return 0;
                 }
+                fprintf(stderr, "Server upstream read failed: stream=%llu fd=%d error=%s (%d)\n",
+                        (unsigned long long)stream_id, stream_ctx->fd, strerror(errno), errno);
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }

@@ -418,7 +418,7 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
         }
         client_ctx->reconnect_pending = false;
         client_ctx->reconnect_delay = 1000000;
-        fprintf(stderr, "Client reconnect attempt started successfully\n");
+        fprintf(stderr, "Client reconnect attempt created; waiting for QUIC confirmation\n");
         return 0;
     }
 
@@ -683,6 +683,10 @@ void* slipstream_client_accepter(void* arg) {
         DBG_PRINTF("Accepted connection from %s:%u on socket %d", client_ip_str, client_port, client_sock);
         fprintf(stderr, "Client accepted local TCP connection: peer=%s:%u fd=%d\n",
                 client_ip_str, client_port, client_sock);
+        if (!args->client_ctx->ready || args->client_ctx->cnx == NULL) {
+            fprintf(stderr, "Client accepted local TCP connection while QUIC tunnel is not ready; fd=%d will wait\n",
+                    client_sock);
+        }
         // --- End printing section ---
 
         slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);

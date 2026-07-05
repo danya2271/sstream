@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/param.h>
 #include <sys/poll.h>
+#include <sys/socket.h>
 #include <assert.h>
 #include <strings.h>
 #include <picoquic_internal.h>
@@ -531,12 +532,40 @@ static void* slipstream_server_poller(void* arg) {
     pthread_exit(NULL);
 }
 
+static void slipstream_server_close_pipe_write_end(slipstream_server_stream_ctx_t* stream_ctx) {
+    if (stream_ctx->pipefd[1] != -1) {
+        close(stream_ctx->pipefd[1]);
+        stream_ctx->pipefd[1] = -1;
+    }
+}
+
+static void slipstream_server_wake_thread(picoquic_network_thread_ctx_t* thread_ctx,
+                                          slipstream_server_stream_ctx_t* stream_ctx,
+                                          const char* reason) {
+    if (thread_ctx == NULL) {
+        return;
+    }
+
+    stream_ctx->set_active = 1;
+    int wake_ret = picoquic_wake_up_network_thread(thread_ctx);
+    if (wake_ret != 0) {
+        fprintf(stderr, "Server stream wakeup failed after %s: stream=%llu ret=%d\n",
+                reason, (unsigned long long)stream_ctx->stream_id, wake_ret);
+    }
+}
+
+static void slipstream_server_wake_stream(slipstream_server_ctx_t* server_ctx,
+                                          slipstream_server_stream_ctx_t* stream_ctx,
+                                          const char* reason) {
+    slipstream_server_wake_thread(server_ctx == NULL ? NULL : server_ctx->thread_ctx, stream_ctx, reason);
+}
+
 typedef struct st_slipstream_io_copy_args {
     int pipe;
     int socket;
     uint64_t stream_id;
-    picoquic_cnx_t* cnx;
-    slipstream_server_ctx_t* server_ctx;
+    picoquic_network_thread_ctx_t* thread_ctx;
+    struct sockaddr_storage upstream_addr;
     slipstream_server_stream_ctx_t* stream_ctx;
 } slipstream_io_copy_args;
 
@@ -562,23 +591,17 @@ void* slipstream_io_copy(void* arg) {
     int pipe = args->pipe;
     int socket = args->socket;
     uint64_t stream_id = args->stream_id;
-    slipstream_server_ctx_t* server_ctx = args->server_ctx;
     slipstream_server_stream_ctx_t* stream_ctx = args->stream_ctx;
 
-    if (connect(socket, (struct sockaddr*)&server_ctx->upstream_addr,
-                slipstream_sockaddr_len(&server_ctx->upstream_addr)) < 0) {
+    if (connect(socket, (struct sockaddr*)&args->upstream_addr,
+                slipstream_sockaddr_len(&args->upstream_addr)) < 0) {
         // Connection failed, close stream
         char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
         fprintf(stderr, "Server upstream connect failed: stream=%llu target=%s error=%s (%d)\n",
                 (unsigned long long)stream_id,
-                slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
+                slipstream_format_sockaddr(&args->upstream_addr, upstream_text, sizeof(upstream_text)),
                 strerror(errno), errno);
-        stream_ctx->set_active = 1;
-        int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
-        if (wake_ret != 0) {
-            fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
-                    (unsigned long long)stream_id, wake_ret);
-        }
+        slipstream_server_wake_thread(args->thread_ctx, stream_ctx, "upstream connect failure");
         slipstream_stream_release(stream_ctx);
         free(args);
         return NULL;
@@ -588,22 +611,30 @@ void* slipstream_io_copy(void* arg) {
     char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
     fprintf(stderr, "Server upstream connected: stream=%llu target=%s fd=%d\n",
             (unsigned long long)stream_id,
-            slipstream_format_sockaddr(&server_ctx->upstream_addr, upstream_text, sizeof(upstream_text)),
+            slipstream_format_sockaddr(&args->upstream_addr, upstream_text, sizeof(upstream_text)),
             socket);
     stream_ctx->set_active = 1;
-    int ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
+    int ret = picoquic_wake_up_network_thread(args->thread_ctx);
     if (ret != 0) {
         fprintf(stderr, "Server upstream wakeup failed: stream=%llu ret=%d\n",
                 (unsigned long long)stream_id, ret);
     }
     DBG_PRINTF("[stream_id=%d][fd=%d] wakeup", stream_ctx->stream_id, socket);
 
+    bool input_fin = false;
+    bool upstream_send_failed = false;
     while (1) {
         // Read from pipe (data coming from QUIC)
         ssize_t bytes_read = read(pipe, buffer, sizeof(buffer));
 
-        // If read fails or returns 0, it means the main thread closed the pipe
-        if (bytes_read <= 0) {
+        if (bytes_read == 0) {
+            input_fin = true;
+            break;
+        }
+        if (bytes_read < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
             break;
         }
 
@@ -620,12 +651,8 @@ void* slipstream_io_copy(void* arg) {
                 }
                 fprintf(stderr, "Server upstream send failed: stream=%llu error=%s (%d)\n",
                         (unsigned long long)stream_id, strerror(errno), errno);
-                stream_ctx->set_active = 1;
-                int wake_ret = picoquic_wake_up_network_thread(args->server_ctx->thread_ctx);
-                if (wake_ret != 0) {
-                    fprintf(stderr, "Server upstream failure wakeup failed: stream=%llu ret=%d\n",
-                            (unsigned long long)stream_id, wake_ret);
-                }
+                upstream_send_failed = true;
+                slipstream_server_wake_thread(args->thread_ctx, stream_ctx, "upstream send failure");
                 goto cleanup; // Exit loop on error
             }
             remaining -= bytes_written;
@@ -634,6 +661,12 @@ void* slipstream_io_copy(void* arg) {
     }
 
 cleanup:
+    if (input_fin && stream_ctx->fd != -1) {
+        (void)shutdown(socket, SHUT_WR);
+        slipstream_server_wake_thread(args->thread_ctx, stream_ctx, "client stream fin");
+    } else if (!upstream_send_failed && stream_ctx->fd != -1) {
+        slipstream_server_wake_thread(args->thread_ctx, stream_ctx, "upstream copy stop");
+    }
     fprintf(stderr, "Server upstream copy stopped: stream=%llu fd=%d\n",
             (unsigned long long)stream_id, socket);
     // Release context reference held by this thread
@@ -698,8 +731,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             args->pipe = stream_ctx->pipefd[0];
             args->socket = stream_ctx->fd;
             args->stream_id = stream_ctx->stream_id;
-            args->cnx = cnx;
-            args->server_ctx = server_ctx;
+            args->thread_ctx = server_ctx->thread_ctx;
+            memcpy(&args->upstream_addr, &server_ctx->upstream_addr, sizeof(args->upstream_addr));
             args->stream_ctx = stream_ctx;
 
             // Retain context for the new thread
@@ -730,7 +763,10 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         if (fin_or_event == picoquic_callback_stream_fin) {
             fprintf(stderr, "Server stream finished: id=%llu fd=%d\n",
                     (unsigned long long)stream_id, stream_ctx == NULL ? -1 : stream_ctx->fd);
-            slipstream_server_free_stream_context(server_ctx, stream_ctx);
+            if (stream_ctx != NULL) {
+                slipstream_server_close_pipe_write_end(stream_ctx);
+                slipstream_server_wake_stream(server_ctx, stream_ctx, "client stream fin");
+            }
         }
         break;
     case picoquic_callback_stop_sending:
@@ -781,7 +817,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                 if (bytes_read == 0) {
                     fprintf(stderr, "Server upstream closed connection: stream=%llu fd=%d\n",
                             (unsigned long long)stream_id, stream_ctx->fd);
-                    (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 1, 0);
+                    slipstream_server_free_stream_context(server_ctx, stream_ctx);
                     return 0;
                 }
                 if (bytes_read > 0) {
@@ -805,7 +842,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             if (bytes_read == 0) {
                 fprintf(stderr, "Server upstream closed while reading: stream=%llu fd=%d\n",
                         (unsigned long long)stream_id, stream_ctx->fd);
-                (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
+                (void)picoquic_provide_stream_data_buffer(bytes, 0, 1, 0);
+                slipstream_server_free_stream_context(server_ctx, stream_ctx);
                 return 0;
             }
             if (bytes_read < 0) {

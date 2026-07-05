@@ -3,18 +3,25 @@ set -euo pipefail
 
 # Defaults can be overridden with environment variables, for example:
 # SLIP_DOMAIN='*.meowda.space' SOCKS_USER='user' SOCKS_PASS='pass' ./install_sstream.sh ./sstream-server.tar.gz
-SLIP_DOMAIN="${SLIP_DOMAIN:-${DOMAIN:-*.meowda.space}}"
-CERT_CN="${CERT_CN:-$SLIP_DOMAIN}"
-SOCKS_USER="${SOCKS_USER:-user}"
-SOCKS_PASS="${SOCKS_PASS:-pass}"
+ENV_SLIP_DOMAIN="${SLIP_DOMAIN:-${DOMAIN:-}}"
+ENV_CERT_CN="${CERT_CN:-}"
+ENV_SOCKS_USER="${SOCKS_USER:-}"
+ENV_SOCKS_PASS="${SOCKS_PASS:-}"
+SLIP_DOMAIN="${ENV_SLIP_DOMAIN:-*.meowda.space}"
+CERT_CN="${ENV_CERT_CN:-$SLIP_DOMAIN}"
+SOCKS_USER="${ENV_SOCKS_USER:-user}"
+SOCKS_PASS="${ENV_SOCKS_PASS:-pass}"
 SOCKS_PORT="${SOCKS_PORT:-1080}"
 SLIP_DNS_PORT="${SLIP_DNS_PORT:-53}"
 SLIP_MTU="${SLIP_MTU:-650}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/slipstream}"
 BINARY_NAME="${BINARY_NAME:-slipstream-server}"
+CONFIG_FILE="${CONFIG_FILE:-$INSTALL_DIR/server.env}"
 
 PACKAGE_PATH="${1:-}"
 TMP_DIR=""
+OLD_SLIP_DOMAIN=""
+OLD_CERT_CN=""
 
 cleanup() {
     if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
@@ -22,6 +29,95 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+is_interactive() {
+    [[ -t 0 ]]
+}
+
+mask_secret() {
+    local value="$1"
+    if [[ -z "$value" ]]; then
+        printf '(empty)'
+    else
+        printf '********'
+    fi
+}
+
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-n}"
+    local answer=""
+
+    if ! is_interactive; then
+        [[ "$default" == "y" ]]
+        return
+    fi
+
+    if [[ "$default" == "y" ]]; then
+        read -r -p "$prompt [Y/n]: " answer
+        [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+    else
+        read -r -p "$prompt [y/N]: " answer
+        [[ "$answer" =~ ^[Yy]$ ]]
+    fi
+}
+
+prompt_value() {
+    local label="$1"
+    local default="$2"
+    local secret="${3:-false}"
+    local value=""
+
+    if ! is_interactive; then
+        PROMPT_VALUE="$default"
+        return
+    fi
+
+    while true; do
+        if [[ "$secret" == "true" ]]; then
+            read -r -s -p "$label [$(mask_secret "$default")]: " value
+            echo
+        else
+            read -r -p "$label [$default]: " value
+        fi
+
+        PROMPT_VALUE="${value:-$default}"
+        if [[ -n "$PROMPT_VALUE" ]]; then
+            return
+        fi
+        echo "Value cannot be empty." >&2
+    done
+}
+
+prompt_server_config() {
+    prompt_value "SOCKS username" "$SOCKS_USER"
+    SOCKS_USER="$PROMPT_VALUE"
+    prompt_value "SOCKS password" "$SOCKS_PASS" true
+    SOCKS_PASS="$PROMPT_VALUE"
+    prompt_value "Slipstream domain" "$SLIP_DOMAIN"
+    SLIP_DOMAIN="$PROMPT_VALUE"
+    CERT_CN="${ENV_CERT_CN:-$SLIP_DOMAIN}"
+}
+
+save_server_config() {
+    install -d -m 0755 "$INSTALL_DIR"
+    umask 077
+    {
+        printf 'SLIP_DOMAIN=%q\n' "$SLIP_DOMAIN"
+        printf 'CERT_CN=%q\n' "$CERT_CN"
+        printf 'SOCKS_USER=%q\n' "$SOCKS_USER"
+        printf 'SOCKS_PASS=%q\n' "$SOCKS_PASS"
+    } > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+}
+
+systemd_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf '"%s"' "$value"
+}
 
 if [[ -z "$PACKAGE_PATH" ]]; then
     echo "Usage: $0 <path-to-sstream-server.tar.gz>" >&2
@@ -38,6 +134,36 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
+install -d -m 0755 "$INSTALL_DIR"
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+    OLD_SLIP_DOMAIN="$SLIP_DOMAIN"
+    OLD_CERT_CN="$CERT_CN"
+
+    if [[ -n "$ENV_SLIP_DOMAIN" ]]; then SLIP_DOMAIN="$ENV_SLIP_DOMAIN"; fi
+    if [[ -n "$ENV_CERT_CN" ]]; then CERT_CN="$ENV_CERT_CN"; fi
+    if [[ -n "$ENV_SOCKS_USER" ]]; then SOCKS_USER="$ENV_SOCKS_USER"; fi
+    if [[ -n "$ENV_SOCKS_PASS" ]]; then SOCKS_PASS="$ENV_SOCKS_PASS"; fi
+
+    echo "Existing Slipstream server config found:"
+    echo "  Domain: $SLIP_DOMAIN"
+    echo "  SOCKS user: $SOCKS_USER"
+    echo "  SOCKS password: $(mask_secret "$SOCKS_PASS")"
+
+    if ask_yes_no "Modify saved domain/user/password?" "n"; then
+        prompt_server_config
+    else
+        echo "Reusing saved domain/user/password."
+    fi
+else
+    echo "No saved Slipstream server config found. Please choose server credentials."
+    prompt_server_config
+fi
+
+save_server_config
+
 echo "Installing dependencies..."
 if [[ -f /etc/debian_version ]]; then
     export DEBIAN_FRONTEND=noninteractive
@@ -51,7 +177,6 @@ else
 fi
 
 echo "Extracting $PACKAGE_PATH to $INSTALL_DIR..."
-install -d -m 0755 "$INSTALL_DIR"
 tar -xzf "$PACKAGE_PATH" -C "$INSTALL_DIR"
 
 if [[ ! -f "$INSTALL_DIR/$BINARY_NAME" ]]; then
@@ -61,7 +186,7 @@ fi
 chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
 cd "$INSTALL_DIR"
-if [[ ! -f server.crt || ! -f server.key ]]; then
+if [[ ! -f server.crt || ! -f server.key || "$SLIP_DOMAIN" != "$OLD_SLIP_DOMAIN" || "$CERT_CN" != "$OLD_CERT_CN" ]]; then
     echo "Generating self-signed certificate for $CERT_CN..."
     openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt \
         -sha256 -days 3650 -nodes \
@@ -98,6 +223,18 @@ net.core.somaxconn=4096
 EOF
 sysctl --system
 
+MICROSOCKS_BIN_ARG="$(systemd_quote "/usr/local/bin/microsocks")"
+MICROSOCKS_PORT_ARG="$(systemd_quote "$SOCKS_PORT")"
+MICROSOCKS_USER_ARG="$(systemd_quote "$SOCKS_USER")"
+MICROSOCKS_PASS_ARG="$(systemd_quote "$SOCKS_PASS")"
+SLIPSTREAM_BIN_ARG="$(systemd_quote "$INSTALL_DIR/$BINARY_NAME")"
+SLIPSTREAM_DOMAIN_ARG="$(systemd_quote "$SLIP_DOMAIN")"
+SLIPSTREAM_DNS_PORT_ARG="$(systemd_quote "$SLIP_DNS_PORT")"
+SLIPSTREAM_TARGET_ARG="$(systemd_quote "127.0.0.1:$SOCKS_PORT")"
+SLIPSTREAM_CERT_ARG="$(systemd_quote "$INSTALL_DIR/server.crt")"
+SLIPSTREAM_KEY_ARG="$(systemd_quote "$INSTALL_DIR/server.key")"
+SLIPSTREAM_MTU_ARG="$(systemd_quote "$SLIP_MTU")"
+
 cat > /etc/systemd/system/microsocks.service <<EOF
 [Unit]
 Description=Microsocks SOCKS5 Server
@@ -105,7 +242,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/microsocks -i 127.0.0.1 -p $SOCKS_PORT -u $SOCKS_USER -P $SOCKS_PASS
+ExecStart=$MICROSOCKS_BIN_ARG -i 127.0.0.1 -p $MICROSOCKS_PORT_ARG -u $MICROSOCKS_USER_ARG -P $MICROSOCKS_PASS_ARG
 Restart=always
 RestartSec=2
 StandardOutput=journal
@@ -125,7 +262,7 @@ Requires=microsocks.service
 
 [Service]
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/$BINARY_NAME --domain $SLIP_DOMAIN --dns-listen-port $SLIP_DNS_PORT --target-address 127.0.0.1:$SOCKS_PORT --cert $INSTALL_DIR/server.crt --key $INSTALL_DIR/server.key --mtu $SLIP_MTU
+ExecStart=$SLIPSTREAM_BIN_ARG --domain $SLIPSTREAM_DOMAIN_ARG --dns-listen-port $SLIPSTREAM_DNS_PORT_ARG --target-address $SLIPSTREAM_TARGET_ARG --cert $SLIPSTREAM_CERT_ARG --key $SLIPSTREAM_KEY_ARG --mtu $SLIPSTREAM_MTU_ARG
 Restart=always
 RestartSec=2
 StandardOutput=journal
@@ -144,6 +281,9 @@ systemctl restart slipstream.service
 echo "------------------------------------------------"
 echo "INSTALLATION COMPLETE"
 echo "Slipstream domain: $SLIP_DOMAIN"
+echo "SOCKS user: $SOCKS_USER"
+echo "SOCKS password: $(mask_secret "$SOCKS_PASS")"
+echo "Saved config: $CONFIG_FILE"
 echo "Client domain example: a.meowda.space"
 echo "Status: systemctl status slipstream.service"
 echo "Logs: journalctl -u slipstream.service -f"

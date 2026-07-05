@@ -9,6 +9,7 @@
 #endif
 #include <assert.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <picoquic_internal.h>
 #include <pthread.h>
 #include <signal.h>
@@ -140,6 +141,7 @@ static size_t client_legacy_query_payload_budget = 0;
 static size_t client_packed_query_payload_budget = 0;
 static size_t client_query_payload_budget = 0;
 static size_t client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
+static bool client_packed_queries_allowed = false;
 
 #define SLIPSTREAM_DNS_NAME_BUFSIZE 255
 
@@ -192,6 +194,10 @@ static void slipstream_client_use_legacy_queries(slipstream_client_ctx_t* client
 }
 
 static void slipstream_client_enable_packed_queries(picoquic_cnx_t* cnx, slipstream_client_ctx_t* client_ctx) {
+    if (!client_packed_queries_allowed) {
+        fprintf(stderr, "Client packed DNS queries offered by server but disabled\n");
+        return;
+    }
     if (client_ctx->packed_queries_enabled || client_packed_query_payload_budget <= client_legacy_query_payload_budget) {
         return;
     }
@@ -1143,6 +1149,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     }
     client_query_payload_budget = client_legacy_query_payload_budget;
     client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
+    client_packed_queries_allowed = getenv("SLIPSTREAM_PACKED_QUERIES") != NULL;
     int mtu = (int)client_query_payload_budget;
 
     /* Create config */
@@ -1165,9 +1172,9 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.alpn = SLIPSTREAM_ALPN;
 
     fprintf(stderr,
-            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu packed-query-payload=%zu cc=%s gso=%s keepalive=%zu\n",
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d dns-query-payload=%zu packed-query-payload=%zu packed-queries=%s cc=%s gso=%s keepalive=%zu\n",
             listen_port, domain_name, server_address_count, mtu, client_query_payload_budget,
-            client_packed_query_payload_budget, cc_algo_id,
+            client_packed_query_payload_budget, client_packed_queries_allowed ? "on" : "off", cc_algo_id,
             gso ? "on" : "off", keep_alive_interval);
 
     /* Create the QUIC context for the server */

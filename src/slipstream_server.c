@@ -49,6 +49,7 @@ char* server_domain_suffix = NULL;
 size_t server_domain_suffix_len = 0;
 bool server_domain_wildcard = false;
 static bool server_stream_logs_enabled = false;
+static bool server_packed_queries_enabled = false;
 
 #define SERVER_STREAM_LOG(...) \
     do { \
@@ -904,7 +905,9 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         break;
     case picoquic_callback_ready:
         fprintf(stderr, "Server QUIC connection ready\n");
-        slipstream_server_send_query_pack_capability(cnx);
+        if (server_packed_queries_enabled) {
+            slipstream_server_send_query_pack_capability(cnx);
+        }
         break;
     default:
         break;
@@ -918,6 +921,7 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     uint64_t current_time = 0;
     slipstream_server_ctx_t default_context = {0};
     server_stream_logs_enabled = getenv("SLIPSTREAM_SERVER_STREAM_LOGS") != NULL;
+    server_packed_queries_enabled = getenv("SLIPSTREAM_PACKED_QUERIES") != NULL;
     if (mtu > SLIPSTREAM_SERVER_MTU_MAX) {
         fprintf(stderr, "Server MTU %d is too large for DNS TXT responses; using %d\n", mtu, SLIPSTREAM_SERVER_MTU_MAX);
         mtu = SLIPSTREAM_SERVER_MTU_MAX;
@@ -938,11 +942,11 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
 
     char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
     fprintf(stderr,
-            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d cert=%s key=%s\n",
+            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d packed-queries=%s cert=%s key=%s\n",
             listen_ipv6 ? "[::]" : "0.0.0.0", server_port, domain_name,
             server_domain_wildcard ? " (wildcard one-label subdomains)" : "",
             slipstream_format_sockaddr(target_address, upstream_text, sizeof(upstream_text)),
-            mtu, server_cert, server_key);
+            mtu, server_packed_queries_enabled ? "on" : "off", server_cert, server_key);
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);

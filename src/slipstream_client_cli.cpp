@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
     bool ipv4 = false;
     bool ipv6 = false;
     for (const auto& res_str : args.resolver) {
-        st_address_t addr;
+        st_address_t addr = {};
         ParsedEndpoint endpoint;
         std::string error;
         if (!parse_endpoint(res_str, 53, &endpoint, &error)) {

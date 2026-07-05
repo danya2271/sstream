@@ -40,6 +40,8 @@ void client_sighandler(int signum) {
 }
 
 #define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 20000
+#define SLIPSTREAM_RESOLVER_PROBE_INITIAL_DELAY_US 1000000
+#define SLIPSTREAM_RESOLVER_PROBE_MAX_DELAY_US 30000000
 
 static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
     if (addr->ss_family == AF_INET) {
@@ -131,8 +133,11 @@ typedef struct st_slipstream_client_ctx_t {
     size_t keep_alive_interval;
     uint64_t reconnect_at;
     uint64_t reconnect_delay;
+    uint64_t* resolver_probe_next_at;
+    uint64_t* resolver_probe_delay;
     uint8_t control_match_pos;
     bool packed_queries_enabled;
+    bool resolver_paths_unavailable_logged;
 } slipstream_client_ctx_t;
 
 char* client_domain_name = NULL;
@@ -491,8 +496,15 @@ static void slipstream_client_free_context(slipstream_client_ctx_t* client_ctx) 
 }
 
 static void slipstream_client_reset_paths(slipstream_client_ctx_t* client_ctx) {
+    client_ctx->resolver_paths_unavailable_logged = false;
     for (size_t i = 0; i < client_ctx->server_address_count; i++) {
         client_ctx->server_addresses[i].added = false;
+        if (client_ctx->resolver_probe_next_at != NULL) {
+            client_ctx->resolver_probe_next_at[i] = 0;
+        }
+        if (client_ctx->resolver_probe_delay != NULL) {
+            client_ctx->resolver_probe_delay[i] = 0;
+        }
     }
 }
 
@@ -597,14 +609,31 @@ void slipstream_client_mark_active_pass(slipstream_client_ctx_t* client_ctx) {
 
 void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
     picoquic_cnx_t* cnx = client_ctx->cnx;
+    if (cnx == NULL || client_ctx->server_address_count <= 1) {
+        return;
+    }
+    if (!cnx->is_multipath_enabled || cnx->path[0] == NULL) {
+        if (!client_ctx->resolver_paths_unavailable_logged) {
+            fprintf(stderr,
+                    "Client resolver multipath unavailable; using primary resolver only (secondary resolvers=%zu)\n",
+                    client_ctx->server_address_count - 1);
+            client_ctx->resolver_paths_unavailable_logged = true;
+        }
+        return;
+    }
+
+    uint64_t current_time = picoquic_current_time();
     // add rest of the resolvers
     for (size_t i = 1; i < client_ctx->server_address_count; i++) {
         address_t* slipstream_path = &client_ctx->server_addresses[i];
         if (slipstream_path->added) {
             continue;
         }
+        if (client_ctx->resolver_probe_next_at != NULL &&
+            current_time < client_ctx->resolver_probe_next_at[i]) {
+            continue;
+        }
 
-        uint64_t current_time = picoquic_current_time();
         // if (current_time - cnx->start_time < 10000000) {
         //     DBG_PRINTF("Can't add path yet", NULL);
         //     continue;
@@ -614,17 +643,37 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
         fprintf(stderr, "Client probing resolver path: %s\n",
                 slipstream_format_sockaddr(&slipstream_path->server_address, addr_text, sizeof(addr_text)));
         int path_id = -2;
-        picoquic_probe_new_path_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->local_addr, 0, current_time, 0, &path_id);
+        int probe_ret = picoquic_probe_new_path_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->local_addr, 0, current_time, 0, &path_id);
         if (path_id < 0) {
+            uint64_t delay = SLIPSTREAM_RESOLVER_PROBE_INITIAL_DELAY_US;
+            if (client_ctx->resolver_probe_delay != NULL && client_ctx->resolver_probe_delay[i] != 0) {
+                delay = client_ctx->resolver_probe_delay[i];
+            }
+            if (client_ctx->resolver_probe_next_at != NULL) {
+                client_ctx->resolver_probe_next_at[i] = current_time + delay;
+            }
+            if (client_ctx->resolver_probe_delay != NULL) {
+                client_ctx->resolver_probe_delay[i] = delay * 2;
+                if (client_ctx->resolver_probe_delay[i] > SLIPSTREAM_RESOLVER_PROBE_MAX_DELAY_US) {
+                    client_ctx->resolver_probe_delay[i] = SLIPSTREAM_RESOLVER_PROBE_MAX_DELAY_US;
+                }
+            }
             DBG_PRINTF("Failed adding path", NULL);
-            fprintf(stderr, "Client resolver path probe failed: %s\n", addr_text);
+            fprintf(stderr, "Client resolver path probe failed: %s ret=%d; retry in %.1f seconds\n",
+                    addr_text, probe_ret, (double)delay / 1000000.0);
             continue;
         }
         DBG_PRINTF("Added path", NULL);
-        fprintf(stderr, "Client resolver path added: %s\n", addr_text);
+        fprintf(stderr, "Client resolver path added: %s path=%d\n", addr_text, path_id);
 
         picoquic_reinsert_by_wake_time(cnx->quic, cnx, current_time);
         slipstream_path->added = true;
+        if (client_ctx->resolver_probe_next_at != NULL) {
+            client_ctx->resolver_probe_next_at[i] = 0;
+        }
+        if (client_ctx->resolver_probe_delay != NULL) {
+            client_ctx->resolver_probe_delay[i] = 0;
+        }
     }
 }
 
@@ -1206,6 +1255,18 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     client_ctx.server_address_count = server_address_count;
     client_ctx.keep_alive_interval = keep_alive_interval;
     client_ctx.reconnect_delay = 1000000;
+    if (server_address_count > 1) {
+        client_ctx.resolver_probe_next_at = calloc(server_address_count, sizeof(*client_ctx.resolver_probe_next_at));
+        client_ctx.resolver_probe_delay = calloc(server_address_count, sizeof(*client_ctx.resolver_probe_delay));
+        if (client_ctx.resolver_probe_next_at == NULL || client_ctx.resolver_probe_delay == NULL) {
+            fprintf(stderr, "Could not allocate resolver probe state\n");
+            free(client_ctx.resolver_probe_next_at);
+            free(client_ctx.resolver_probe_delay);
+            picoquic_free(quic);
+            return -1;
+        }
+    }
+    slipstream_client_reset_paths(&client_ctx);
 
     picoquic_cnx_t* cnx = NULL;
     ret = slipstream_connect(&client_ctx.server_addresses[0].server_address, quic, &cnx, &client_ctx);
@@ -1294,6 +1355,8 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     /* And finish. */
     fprintf(stderr, "Client exit, ret = %d\n", ret);
 
+    free(client_ctx.resolver_probe_next_at);
+    free(client_ctx.resolver_probe_delay);
     picoquic_free(quic);
 
     return ret;

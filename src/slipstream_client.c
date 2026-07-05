@@ -37,7 +37,7 @@ void client_sighandler(int signum) {
     should_shutdown = 1;
 }
 
-#define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 50000
+#define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 20000
 
 static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
     if (addr->ss_family == AF_INET) {

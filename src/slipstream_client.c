@@ -78,6 +78,33 @@ static const char* slipstream_client_event_name(picoquic_call_back_event_t event
     }
 }
 
+static void slipstream_client_log_path_event(picoquic_cnx_t* cnx, uint64_t unique_path_id, const char* event_name) {
+    struct sockaddr_storage peer_addr = {0};
+    struct sockaddr_storage local_addr = {0};
+    char peer_text[NI_MAXHOST + NI_MAXSERV + 8];
+    char local_text[NI_MAXHOST + NI_MAXSERV + 8];
+    picoquic_path_quality_t quality = {0};
+
+    if (picoquic_get_path_addr(cnx, unique_path_id, 2, &peer_addr) != 0) {
+        peer_addr.ss_family = 0;
+    }
+    if (picoquic_get_path_addr(cnx, unique_path_id, 1, &local_addr) != 0) {
+        local_addr.ss_family = 0;
+    }
+    (void)picoquic_get_path_quality(cnx, unique_path_id, &quality);
+
+    fprintf(stderr,
+            "Client resolver path %s: id=%llu peer=%s local=%s rtt=%.1fms sent=%llu lost=%llu cwin=%llu\n",
+            event_name,
+            (unsigned long long)unique_path_id,
+            peer_addr.ss_family == 0 ? "unknown" : slipstream_format_sockaddr(&peer_addr, peer_text, sizeof(peer_text)),
+            local_addr.ss_family == 0 ? "unknown" : slipstream_format_sockaddr(&local_addr, local_text, sizeof(local_text)),
+            (double)quality.rtt / 1000.0,
+            (unsigned long long)quality.sent,
+            (unsigned long long)quality.lost,
+            (unsigned long long)quality.cwin);
+}
+
 
 typedef struct st_slipstream_client_stream_ctx_t {
     struct st_slipstream_client_stream_ctx_t* next_stream;
@@ -888,8 +915,25 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_ready:
         fprintf(stderr, "Client QUIC connection confirmed\n");
         client_ctx->ready = true;
+        fprintf(stderr, "Client QUIC multipath: negotiated=%s paths=%d resolvers=%zu\n",
+                cnx->is_multipath_enabled ? "yes" : "no",
+                cnx->nb_paths,
+                client_ctx->server_address_count);
+        slipstream_client_log_path_event(cnx, 0, "primary ready");
         slipstream_add_paths(client_ctx);
         slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
+        break;
+    case picoquic_callback_path_available:
+        slipstream_client_log_path_event(cnx, stream_id, "available");
+        break;
+    case picoquic_callback_path_suspended:
+        slipstream_client_log_path_event(cnx, stream_id, "suspended");
+        break;
+    case picoquic_callback_path_deleted:
+        fprintf(stderr, "Client resolver path deleted: id=%llu\n", (unsigned long long)stream_id);
+        break;
+    case picoquic_callback_path_quality_changed:
+        slipstream_client_log_path_event(cnx, stream_id, "quality changed");
         break;
     case picoquic_callback_app_wakeup:
         if (client_ctx->ready && client_ctx->first_stream != NULL) {
@@ -938,6 +982,7 @@ static int slipstream_connect(struct sockaddr_storage* server_address,
     client_ctx->cnx = *cnx;
     /* Set the client callback context */
     picoquic_set_callback(*cnx, slipstream_client_callback, client_ctx);
+    picoquic_enable_path_callbacks(*cnx, 1);
     /* Client connection parameters could be set here, before starting the connection. */
     ret = picoquic_start_client_cnx(*cnx);
     if (ret < 0) {

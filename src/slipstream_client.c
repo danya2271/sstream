@@ -894,7 +894,7 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_app_wakeup:
         if (client_ctx->ready && client_ctx->first_stream != NULL) {
             cnx->is_poll_requested = 1;
-            slipstream_client_schedule_active_poll(client_ctx, stream_id);
+            slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
         }
         else {
             picoquic_set_app_wake_time(cnx, 0);

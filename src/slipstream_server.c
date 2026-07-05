@@ -844,9 +844,8 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                     return 0;
                 }
                 if (bytes_read > 0) {
-                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
-                    picoquic_mark_active_stream(cnx, stream_id, 1, stream_ctx);
-                    return 0;
+                    (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 1);
+                    break;
                 }
                 if (bytes_read < 0) {
                     fprintf(stderr, "Server upstream peek failed: stream=%llu fd=%d error=%s (%d)\n",

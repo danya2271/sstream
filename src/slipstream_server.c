@@ -96,6 +96,9 @@ typedef struct st_slipstream_server_stream_ctx_t {
     uint64_t stream_id;
     volatile sig_atomic_t set_active;
     volatile int poller_active;
+    volatile int summary_logged;
+    uint64_t bytes_to_upstream;
+    uint64_t bytes_from_upstream;
     int ref_count; /* Reference counter for thread safety */
 } slipstream_server_stream_ctx_t;
 
@@ -123,6 +126,21 @@ void slipstream_stream_release(slipstream_server_stream_ctx_t* ctx) {
         free(ctx);
         // DBG_PRINTF("Stream context freed from memory", NULL);
     }
+}
+
+static void slipstream_server_log_stream_summary(slipstream_server_stream_ctx_t* stream_ctx,
+                                                 const char* reason) {
+    if (!__sync_bool_compare_and_swap(&stream_ctx->summary_logged, 0, 1)) {
+        return;
+    }
+
+    fprintf(stderr,
+            "Server stream closed: id=%llu fd=%d reason=%s client_to_upstream=%llu upstream_to_client=%llu\n",
+            (unsigned long long)stream_ctx->stream_id,
+            stream_ctx->fd,
+            reason,
+            (unsigned long long)stream_ctx->bytes_to_upstream,
+            (unsigned long long)stream_ctx->bytes_from_upstream);
 }
 
 ssize_t server_encode(void* slot_p, void* callback_ctx, unsigned char** dest_buf, const unsigned char* src_buf, size_t src_buf_len, size_t* segment_len, struct sockaddr_storage* peer_addr, struct sockaddr_storage* local_addr) {
@@ -356,7 +374,10 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
 /* FIXED: This function now unlinks the stream but does NOT necessarily free memory.
    It closes FDs to signal threads to stop, then releases its reference. */
 static void slipstream_server_free_stream_context(slipstream_server_ctx_t* server_ctx,
-                                             slipstream_server_stream_ctx_t* stream_ctx) {
+                                             slipstream_server_stream_ctx_t* stream_ctx,
+                                             const char* reason) {
+    slipstream_server_log_stream_summary(stream_ctx, reason);
+
     // 1. Unlink from the list so main thread ignores it from now on
     if (stream_ctx->previous_stream != NULL) {
         stream_ctx->previous_stream->next_stream = stream_ctx->next_stream;
@@ -395,7 +416,7 @@ static void slipstream_server_free_stream_context(slipstream_server_ctx_t* serve
 static void slipstream_server_free_context(slipstream_server_ctx_t* server_ctx) {
     slipstream_server_stream_ctx_t* stream_ctx;
     while ((stream_ctx = server_ctx->first_stream) != NULL) {
-        slipstream_server_free_stream_context(server_ctx, stream_ctx);
+        slipstream_server_free_stream_context(server_ctx, stream_ctx, "connection close");
     }
     if (server_ctx->prev_ctx) {
         server_ctx->prev_ctx->next_ctx = server_ctx->next_ctx;
@@ -655,6 +676,7 @@ void* slipstream_io_copy(void* arg) {
                 slipstream_server_wake_thread(args->thread_ctx, stream_ctx, "upstream send failure");
                 goto cleanup; // Exit loop on error
             }
+            __sync_add_and_fetch(&stream_ctx->bytes_to_upstream, (uint64_t)bytes_written);
             remaining -= bytes_written;
             p += bytes_written;
         }
@@ -721,7 +743,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             stream_ctx = slipstream_server_create_stream_ctx(server_ctx, stream_id);
             if (stream_ctx == NULL || picoquic_set_app_stream_ctx(cnx, stream_id, stream_ctx) != 0) {
                 if (stream_ctx != NULL) {
-                    slipstream_server_free_stream_context(server_ctx, stream_ctx);
+                    slipstream_server_free_stream_context(server_ctx, stream_ctx, "stream setup failure");
                 }
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
@@ -775,7 +797,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
         if (stream_ctx != NULL) {
             fprintf(stderr, "Server stream reset: id=%llu fd=%d\n",
                     (unsigned long long)stream_id, stream_ctx->fd);
-            slipstream_server_free_stream_context(server_ctx, stream_ctx);
+            slipstream_server_free_stream_context(server_ctx, stream_ctx, "stream reset");
             picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
         }
         break;
@@ -818,7 +840,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                     fprintf(stderr, "Server upstream closed connection: stream=%llu fd=%d\n",
                             (unsigned long long)stream_id, stream_ctx->fd);
                     (void)picoquic_provide_stream_data_buffer(bytes, 0, 1, 0);
-                    slipstream_server_free_stream_context(server_ctx, stream_ctx);
+                    slipstream_server_free_stream_context(server_ctx, stream_ctx, "upstream eof");
                     return 0;
                 }
                 if (bytes_read > 0) {
@@ -843,7 +865,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                 fprintf(stderr, "Server upstream closed while reading: stream=%llu fd=%d\n",
                         (unsigned long long)stream_id, stream_ctx->fd);
                 (void)picoquic_provide_stream_data_buffer(bytes, 0, 1, 0);
-                slipstream_server_free_stream_context(server_ctx, stream_ctx);
+                slipstream_server_free_stream_context(server_ctx, stream_ctx, "upstream eof");
                 return 0;
             }
             if (bytes_read < 0) {
@@ -857,6 +879,7 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
                 (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
                 return 0;
             }
+            __sync_add_and_fetch(&stream_ctx->bytes_from_upstream, (uint64_t)bytes_read);
             uint8_t* buffer = picoquic_provide_stream_data_buffer(bytes, (size_t)bytes_read, 0, 1);
             if (buffer == NULL) break;
             memcpy(buffer, stack_buffer, (size_t)bytes_read);

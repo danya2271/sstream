@@ -40,6 +40,7 @@ void client_sighandler(int signum) {
 }
 
 #define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 20000
+#define SLIPSTREAM_RESOLVER_CONNECT_TIMEOUT_US 10000000
 #define SLIPSTREAM_RESOLVER_PROBE_INITIAL_DELAY_US 1000000
 #define SLIPSTREAM_RESOLVER_PROBE_MAX_DELAY_US 30000000
 
@@ -133,6 +134,9 @@ typedef struct st_slipstream_client_ctx_t {
     size_t keep_alive_interval;
     uint64_t reconnect_at;
     uint64_t reconnect_delay;
+    size_t active_resolver_index;
+    size_t next_resolver_index;
+    uint64_t connect_started_at;
     uint64_t* resolver_probe_next_at;
     uint64_t* resolver_probe_delay;
     uint8_t control_match_pos;
@@ -190,6 +194,17 @@ static size_t slipstream_client_packed_query_budget(size_t domain_len) {
 static int slipstream_connect(struct sockaddr_storage* server_address,
                               picoquic_quic_t* quic, picoquic_cnx_t** cnx,
                               slipstream_client_ctx_t* client_ctx);
+
+static size_t slipstream_client_next_resolver_index(const slipstream_client_ctx_t* client_ctx, size_t resolver_index) {
+    if (client_ctx->server_address_count == 0) {
+        return 0;
+    }
+    resolver_index++;
+    if (resolver_index >= client_ctx->server_address_count) {
+        resolver_index = 0;
+    }
+    return resolver_index;
+}
 
 static void slipstream_client_use_legacy_queries(slipstream_client_ctx_t* client_ctx) {
     client_ctx->packed_queries_enabled = false;
@@ -422,8 +437,8 @@ ssize_t client_decode(void* slot_p, void* callback_ctx, unsigned char** dest_buf
     return answer_txt->len;
 }
 
-slipstream_client_stream_ctx_t* slipstream_client_create_stream_ctx(picoquic_cnx_t* cnx,
-                                           slipstream_client_ctx_t* client_ctx, int sock_fd) {
+slipstream_client_stream_ctx_t* slipstream_client_create_stream_ctx(slipstream_client_ctx_t* client_ctx,
+                                                                    int sock_fd) {
     slipstream_client_stream_ctx_t* stream_ctx = malloc(sizeof(slipstream_client_stream_ctx_t));
 
     if (stream_ctx == NULL) {
@@ -538,18 +553,94 @@ static void slipstream_client_schedule_active_poll(slipstream_client_ctx_t* clie
     }
 }
 
+static int slipstream_client_connect_resolver(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx,
+                                              size_t resolver_index) {
+    if (resolver_index >= client_ctx->server_address_count) {
+        return -1;
+    }
+
+    picoquic_cnx_t* cnx = NULL;
+    char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+    fprintf(stderr, "Client resolver connect attempt: index=%zu/%zu resolver=%s\n",
+            resolver_index + 1, client_ctx->server_address_count,
+            slipstream_format_sockaddr(&client_ctx->server_addresses[resolver_index].server_address,
+                                       resolver_text, sizeof(resolver_text)));
+
+    int ret = slipstream_connect(&client_ctx->server_addresses[resolver_index].server_address, quic, &cnx, client_ctx);
+    if (ret == 0) {
+        client_ctx->active_resolver_index = resolver_index;
+        client_ctx->next_resolver_index = slipstream_client_next_resolver_index(client_ctx, resolver_index);
+        client_ctx->connect_started_at = picoquic_current_time();
+    }
+    return ret;
+}
+
+static int slipstream_client_connect_next_resolver(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx) {
+    if (client_ctx->server_address_count == 0) {
+        fprintf(stderr, "Client has no resolver addresses configured\n");
+        return -1;
+    }
+
+    size_t start_index = client_ctx->next_resolver_index;
+    if (start_index >= client_ctx->server_address_count) {
+        start_index = 0;
+    }
+
+    int last_ret = -1;
+    for (size_t attempt = 0; attempt < client_ctx->server_address_count; attempt++) {
+        size_t resolver_index = (start_index + attempt) % client_ctx->server_address_count;
+        last_ret = slipstream_client_connect_resolver(quic, client_ctx, resolver_index);
+        if (last_ret == 0) {
+            return 0;
+        }
+        client_ctx->next_resolver_index = slipstream_client_next_resolver_index(client_ctx, resolver_index);
+    }
+
+    return last_ret;
+}
+
 static void slipstream_client_connection_lost(slipstream_client_ctx_t* client_ctx) {
     if (should_shutdown || client_ctx->reconnect_pending) {
         return;
     }
     client_ctx->ready = false;
-    fprintf(stderr, "Client QUIC connection lost\n");
+    client_ctx->connect_started_at = 0;
+    char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+    if (client_ctx->active_resolver_index < client_ctx->server_address_count) {
+        fprintf(stderr, "Client QUIC connection lost: resolver=%s index=%zu/%zu\n",
+                slipstream_format_sockaddr(&client_ctx->server_addresses[client_ctx->active_resolver_index].server_address,
+                                           resolver_text, sizeof(resolver_text)),
+                client_ctx->active_resolver_index + 1, client_ctx->server_address_count);
+    } else {
+        fprintf(stderr, "Client QUIC connection lost\n");
+    }
     slipstream_client_schedule_reconnect(client_ctx, picoquic_current_time());
 }
 
-static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx) {
-    picoquic_cnx_t* cnx = NULL;
+static void slipstream_client_check_connect_timeout(slipstream_client_ctx_t* client_ctx, uint64_t current_time) {
+    if (should_shutdown || client_ctx->ready || client_ctx->reconnect_pending || client_ctx->cnx == NULL ||
+        client_ctx->connect_started_at == 0 ||
+        current_time - client_ctx->connect_started_at < SLIPSTREAM_RESOLVER_CONNECT_TIMEOUT_US) {
+        return;
+    }
 
+    char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+    if (client_ctx->active_resolver_index < client_ctx->server_address_count) {
+        fprintf(stderr, "Client QUIC connect timed out: resolver=%s index=%zu/%zu; trying next resolver\n",
+                slipstream_format_sockaddr(&client_ctx->server_addresses[client_ctx->active_resolver_index].server_address,
+                                           resolver_text, sizeof(resolver_text)),
+                client_ctx->active_resolver_index + 1, client_ctx->server_address_count);
+    } else {
+        fprintf(stderr, "Client QUIC connect timed out; trying next resolver\n");
+    }
+
+    picoquic_delete_cnx(client_ctx->cnx);
+    client_ctx->cnx = NULL;
+    client_ctx->connect_started_at = 0;
+    slipstream_client_schedule_reconnect(client_ctx, current_time);
+}
+
+static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx) {
     while (client_ctx->first_stream != NULL) {
         slipstream_client_free_stream_ctx(client_ctx, client_ctx->first_stream);
     }
@@ -563,16 +654,11 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
     slipstream_client_reset_paths(client_ctx);
     slipstream_client_use_legacy_queries(client_ctx);
 
-    fprintf(stderr, "Client reconnect attempt starting\n");
-    int ret = slipstream_connect(&client_ctx->server_addresses[0].server_address, quic, &cnx, client_ctx);
+    fprintf(stderr, "Client reconnect attempt starting: next-resolver=%zu/%zu\n",
+            client_ctx->next_resolver_index + 1, client_ctx->server_address_count);
+    int ret = slipstream_client_connect_next_resolver(quic, client_ctx);
     if (ret == 0) {
-        if (client_ctx->keep_alive_interval != 0) {
-            picoquic_enable_keep_alive(cnx, client_ctx->keep_alive_interval * 1000);
-        } else {
-            picoquic_disable_keep_alive(cnx);
-        }
         client_ctx->reconnect_pending = false;
-        client_ctx->reconnect_delay = 1000000;
         fprintf(stderr, "Client reconnect attempt created; waiting for QUIC confirmation\n");
         return 0;
     }
@@ -624,7 +710,8 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
 
     uint64_t current_time = picoquic_current_time();
     // add rest of the resolvers
-    for (size_t i = 1; i < client_ctx->server_address_count; i++) {
+    for (size_t offset = 1; offset < client_ctx->server_address_count; offset++) {
+        size_t i = (client_ctx->active_resolver_index + offset) % client_ctx->server_address_count;
         address_t* slipstream_path = &client_ctx->server_addresses[i];
         if (slipstream_path->added) {
             continue;
@@ -687,6 +774,11 @@ int slipstream_client_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_l
 
     switch (cb_mode) {
     case picoquic_packet_loop_before_select:
+        {
+            uint64_t current_time = picoquic_current_time();
+            slipstream_client_check_connect_timeout(client_ctx, current_time);
+        }
+
         if (should_shutdown) {
             // Iterate and close all connections
             picoquic_cnx_t* cnx = picoquic_get_first_cnx(quic);
@@ -837,7 +929,6 @@ static void* slipstream_client_poller(void* arg) {
 
 typedef struct st_slipstream_client_accepter_args {
     int fd;
-    picoquic_cnx_t* cnx;
     slipstream_client_ctx_t* client_ctx;
     slipstream_client_stream_ctx_t* stream_ctx;
     picoquic_network_thread_ctx_t* thread_ctx;
@@ -881,7 +972,7 @@ void* slipstream_client_accepter(void* arg) {
         }
         // --- End printing section ---
 
-        slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->cnx, args->client_ctx, client_sock);
+        slipstream_client_stream_ctx_t* stream_ctx = slipstream_client_create_stream_ctx(args->client_ctx, client_sock);
         if (stream_ctx == NULL) {
             fprintf(stderr, "Could not initiate stream for %d\n", client_sock);
             break;
@@ -1083,6 +1174,14 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     case picoquic_callback_ready:
         fprintf(stderr, "Client QUIC connection confirmed\n");
         client_ctx->ready = true;
+        client_ctx->reconnect_delay = 1000000;
+        client_ctx->connect_started_at = 0;
+        client_ctx->next_resolver_index = client_ctx->active_resolver_index;
+        char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+        fprintf(stderr, "Client active resolver: index=%zu/%zu resolver=%s\n",
+                client_ctx->active_resolver_index + 1, client_ctx->server_address_count,
+                slipstream_format_sockaddr(&client_ctx->server_addresses[client_ctx->active_resolver_index].server_address,
+                                           resolver_text, sizeof(resolver_text)));
         fprintf(stderr, "Client QUIC multipath: negotiated=%s paths=%d resolvers=%zu\n",
                 cnx->is_multipath_enabled ? "yes" : "no",
                 cnx->nb_paths,
@@ -1184,6 +1283,11 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     int ret = 0;
     uint64_t current_time = 0;
 
+    if (server_address_count == 0) {
+        fprintf(stderr, "Client error: at least one resolver address is required\n");
+        return -1;
+    }
+
     client_domain_name = strdup(domain_name);
     client_domain_name_len = strlen(domain_name);
     client_legacy_query_payload_budget = slipstream_client_legacy_query_budget(client_domain_name_len);
@@ -1255,6 +1359,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     client_ctx.server_address_count = server_address_count;
     client_ctx.keep_alive_interval = keep_alive_interval;
     client_ctx.reconnect_delay = 1000000;
+    client_ctx.next_resolver_index = 0;
     if (server_address_count > 1) {
         client_ctx.resolver_probe_next_at = calloc(server_address_count, sizeof(*client_ctx.resolver_probe_next_at));
         client_ctx.resolver_probe_delay = calloc(server_address_count, sizeof(*client_ctx.resolver_probe_delay));
@@ -1268,8 +1373,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     }
     slipstream_client_reset_paths(&client_ctx);
 
-    picoquic_cnx_t* cnx = NULL;
-    ret = slipstream_connect(&client_ctx.server_addresses[0].server_address, quic, &cnx, &client_ctx);
+    ret = slipstream_client_connect_next_resolver(quic, &client_ctx);
     if (ret != 0) {
         fprintf(stderr, "Could not connect to server, will retry\n");
         client_ctx.reconnect_pending = true;
@@ -1334,7 +1438,6 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
 
     slipstream_client_accepter_args* args = malloc(sizeof(slipstream_client_accepter_args));
     args->fd = client_ctx.listen_sock;
-    args->cnx = cnx;
     args->client_ctx = &client_ctx;
     args->thread_ctx = &thread_ctx;
 

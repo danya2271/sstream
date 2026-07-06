@@ -18,6 +18,8 @@ extern "C" {
 
 #define SLIPSTREAM_QLOG_DIR "./qlog";
 #define SLIPSTREAM_SERVER_MTU_MAX 1190
+#define SLIPSTREAM_SERVER_MTU_INITIAL 650
+#define SLIPSTREAM_CLIENT_RESPONSE_MTU_MAX SLIPSTREAM_SERVER_MTU_MAX
 #include <stdbool.h>
 
 typedef struct st_address_t {

@@ -151,6 +151,7 @@ static size_t client_packed_query_payload_budget = 0;
 static size_t client_query_payload_budget = 0;
 static size_t client_query_label_max = SLIPSTREAM_DNS_LEGACY_ENCODED_LABEL_MAX;
 static bool client_packed_queries_allowed = false;
+static const uint32_t client_response_mtu_max = SLIPSTREAM_CLIENT_RESPONSE_MTU_MAX;
 
 #define SLIPSTREAM_DNS_NAME_BUFSIZE 255
 
@@ -206,6 +207,18 @@ static size_t slipstream_client_next_resolver_index(const slipstream_client_ctx_
     return resolver_index;
 }
 
+static void slipstream_client_advertise_response_mtu(picoquic_quic_t* quic) {
+    picoquic_tp_t tp = *picoquic_get_default_tp(quic);
+    tp.max_packet_size = client_response_mtu_max;
+    (void)picoquic_set_default_tp(quic, &tp);
+}
+
+static void slipstream_client_set_query_mtu(picoquic_quic_t* quic, size_t query_mtu) {
+    picoquic_set_mtu_max(quic, (uint32_t)query_mtu);
+    picoquic_set_initial_send_mtu(quic, (uint32_t)query_mtu, (uint32_t)query_mtu);
+    slipstream_client_advertise_response_mtu(quic);
+}
+
 static void slipstream_client_use_legacy_queries(slipstream_client_ctx_t* client_ctx) {
     client_ctx->packed_queries_enabled = false;
     client_ctx->control_match_pos = 0;
@@ -227,9 +240,7 @@ static void slipstream_client_enable_packed_queries(picoquic_cnx_t* cnx, slipstr
     client_query_label_max = SLIPSTREAM_DNS_ENCODED_LABEL_MAX;
 
     picoquic_quic_t* quic = picoquic_get_quic_ctx(cnx);
-    picoquic_set_mtu_max(quic, (uint32_t)client_packed_query_payload_budget);
-    picoquic_set_initial_send_mtu(quic, (uint32_t)client_packed_query_payload_budget,
-                                  (uint32_t)client_packed_query_payload_budget);
+    slipstream_client_set_query_mtu(quic, client_packed_query_payload_budget);
 
     for (int i = 0; i < cnx->nb_paths; i++) {
         if (cnx->path[i] != NULL && cnx->path[i]->send_mtu < client_packed_query_payload_budget) {
@@ -653,6 +664,7 @@ static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_
     client_ctx->ready = false;
     slipstream_client_reset_paths(client_ctx);
     slipstream_client_use_legacy_queries(client_ctx);
+    slipstream_client_set_query_mtu(quic, client_query_payload_budget);
 
     fprintf(stderr, "Client reconnect attempt starting: next-resolver=%zu/%zu\n",
             client_ctx->next_resolver_index + 1, client_ctx->server_address_count);
@@ -1326,9 +1338,9 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     config.alpn = SLIPSTREAM_ALPN;
 
     fprintf(stderr,
-            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu mtu=%d cid-len=%d dns-query-payload=%zu packed-query-payload=%zu packed-queries=%s cc=%s gso=%s keepalive=%zu\n",
-            listen_port, domain_name, server_address_count, mtu, client_query_payload_budget,
-            SLIPSTREAM_CONNECTION_ID_LEN, client_packed_query_payload_budget,
+            "Client starting: listen=0.0.0.0:%d domain=%s resolvers=%zu query-mtu=%d response-mtu=%u cid-len=%d dns-query-payload=%zu packed-query-payload=%zu packed-queries=%s cc=%s gso=%s keepalive=%zu\n",
+            listen_port, domain_name, server_address_count, mtu, client_response_mtu_max,
+            SLIPSTREAM_CONNECTION_ID_LEN, client_query_payload_budget, client_packed_query_payload_budget,
             client_packed_queries_allowed ? "on" : "off", cc_algo_id, gso ? "on" : "off",
             keep_alive_interval);
 
@@ -1342,6 +1354,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         fprintf(stderr, "Could not create server context\n");
         return -1;
     }
+    slipstream_client_advertise_response_mtu(quic);
 
     picoquic_set_cookie_mode(quic, 0);
     picoquic_set_default_priority(quic, 2);

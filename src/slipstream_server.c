@@ -926,6 +926,8 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
         fprintf(stderr, "Server MTU %d is too large for DNS TXT responses; using %d\n", mtu, SLIPSTREAM_SERVER_MTU_MAX);
         mtu = SLIPSTREAM_SERVER_MTU_MAX;
     }
+    const int initial_mtu = mtu < SLIPSTREAM_SERVER_MTU_INITIAL ? mtu : SLIPSTREAM_SERVER_MTU_INITIAL;
+    const int mtu_probe_ceiling = mtu + (listen_ipv6 ? 48 : 28);
 
     memcpy(&default_context.upstream_addr, target_address, sizeof(struct sockaddr_storage));
 
@@ -942,12 +944,12 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
 
     char upstream_text[NI_MAXHOST + NI_MAXSERV + 8];
     fprintf(stderr,
-            "Server starting: listen=%s:%d domain=%s%s target=%s mtu=%d cid-len=%d packed-queries=%s cert=%s key=%s\n",
+            "Server starting: listen=%s:%d domain=%s%s target=%s mtu-initial=%d mtu-max=%d cid-len=%d pmtud=required packed-queries=%s cert=%s key=%s\n",
             listen_ipv6 ? "[::]" : "0.0.0.0", server_port, domain_name,
             server_domain_wildcard ? " (wildcard one-label subdomains)" : "",
             slipstream_format_sockaddr(target_address, upstream_text, sizeof(upstream_text)),
-            mtu, SLIPSTREAM_CONNECTION_ID_LEN, server_packed_queries_enabled ? "on" : "off",
-            server_cert, server_key);
+            initial_mtu, mtu, SLIPSTREAM_CONNECTION_ID_LEN,
+            server_packed_queries_enabled ? "on" : "off", server_cert, server_key);
 
     picoquic_quic_config_t config;
     picoquic_config_init(&config);
@@ -958,9 +960,9 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
     config.qlog_dir = SLIPSTREAM_QLOG_DIR;
 #endif
     config.server_port = server_port;
-    config.mtu_max = mtu;
-    config.initial_send_mtu_ipv4 = mtu;
-    config.initial_send_mtu_ipv6 = mtu;
+    config.mtu_max = mtu_probe_ceiling;
+    config.initial_send_mtu_ipv4 = initial_mtu;
+    config.initial_send_mtu_ipv6 = initial_mtu;
     config.cnx_id_length = SLIPSTREAM_CONNECTION_ID_LEN;
     config.multipath_option = 1;
     config.use_long_log = 0;
@@ -981,6 +983,7 @@ int picoquic_slipstream_server(int server_port, bool listen_ipv6, int mtu, const
 #endif
     picoquic_set_key_log_file_from_env(quic);
     picoquic_set_default_congestion_algorithm(quic, slipstream_server_cc_algorithm);
+    picoquic_set_default_pmtud_policy(quic, picoquic_pmtud_required);
 
     picoquic_packet_loop_param_t param = {0};
     if (listen_ipv6) {

@@ -63,6 +63,12 @@ void client_sighandler(int signum) {
 #define SLIPSTREAM_RESOLVER_MTU_STEP_MIN_BYTES 12
 #define SLIPSTREAM_RESOLVER_MTU_GROW_STEP_BYTES 8
 #define SLIPSTREAM_RESOLVER_MTU_GOOD_WINDOWS_TO_GROW 5
+#define SLIPSTREAM_RESOLVER_HEALTH_CHECK_INTERVAL_US 1000000
+#define SLIPSTREAM_RESOLVER_RESELECTION_INTERVAL_US 5000000
+#define SLIPSTREAM_RESOLVER_SAMPLE_STALE_US 12000000
+#define SLIPSTREAM_RESOLVER_FAILOVER_MIN_INTERVAL_US 8000000
+#define SLIPSTREAM_RESOLVER_ACTIVE_BAD_LOSS_PERMILLE 200
+#define SLIPSTREAM_RESOLVER_ACTIVE_BAD_WINDOWS 2
 
 static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
     if (addr->ss_family == AF_INET) {
@@ -167,6 +173,7 @@ typedef struct st_slipstream_client_ctx_t {
     uint64_t* resolver_last_lost;
     uint64_t* resolver_loss_permille;
     uint64_t* resolver_cwin;
+    uint64_t* resolver_sampled_at;
     uint64_t* resolver_unhealthy_until;
     uint64_t* resolver_quality_log_next_at;
     size_t* resolver_send_mtu;
@@ -179,6 +186,11 @@ typedef struct st_slipstream_client_ctx_t {
     bool resolver_selection_in_progress;
     bool resolver_selection_done;
     bool resolver_switch_pending;
+    bool resolver_failover_pending;
+    uint8_t active_resolver_bad_windows;
+    uint64_t resolver_health_next_at;
+    uint64_t resolver_reselection_next_at;
+    uint64_t resolver_failover_next_at;
     uint64_t resolver_selection_started_at;
     uint64_t resolver_selection_deadline_at;
 } slipstream_client_ctx_t;
@@ -593,6 +605,12 @@ static void slipstream_client_free_context(slipstream_client_ctx_t* client_ctx) 
 static void slipstream_client_reset_paths(slipstream_client_ctx_t* client_ctx) {
     client_ctx->resolver_paths_unavailable_logged = false;
     client_ctx->resolver_selection_in_progress = false;
+    client_ctx->resolver_selection_done = false;
+    client_ctx->resolver_switch_pending = false;
+    client_ctx->resolver_failover_pending = false;
+    client_ctx->active_resolver_bad_windows = 0;
+    client_ctx->resolver_health_next_at = 0;
+    client_ctx->resolver_reselection_next_at = 0;
     client_ctx->resolver_selection_started_at = 0;
     client_ctx->resolver_selection_deadline_at = 0;
     for (size_t i = 0; i < client_ctx->server_address_count; i++) {
@@ -626,6 +644,9 @@ static void slipstream_client_reset_paths(slipstream_client_ctx_t* client_ctx) {
         }
         if (client_ctx->resolver_cwin != NULL) {
             client_ctx->resolver_cwin[i] = 0;
+        }
+        if (client_ctx->resolver_sampled_at != NULL) {
+            client_ctx->resolver_sampled_at[i] = 0;
         }
         if (client_ctx->resolver_quality_log_next_at != NULL) {
             client_ctx->resolver_quality_log_next_at[i] = 0;
@@ -689,6 +710,30 @@ static void slipstream_client_record_resolver_path_id(slipstream_client_ctx_t* c
         if (client_ctx->resolver_rtt_us != NULL) {
             client_ctx->resolver_rtt_us[resolver_index] = 0;
         }
+        if (client_ctx->resolver_sent != NULL) {
+            client_ctx->resolver_sent[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_lost != NULL) {
+            client_ctx->resolver_lost[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_last_sent != NULL) {
+            client_ctx->resolver_last_sent[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_last_lost != NULL) {
+            client_ctx->resolver_last_lost[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_loss_permille != NULL) {
+            client_ctx->resolver_loss_permille[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_cwin != NULL) {
+            client_ctx->resolver_cwin[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_sampled_at != NULL) {
+            client_ctx->resolver_sampled_at[resolver_index] = 0;
+        }
+        if (client_ctx->resolver_mtu_good_windows != NULL) {
+            client_ctx->resolver_mtu_good_windows[resolver_index] = 0;
+        }
         if (client_ctx->resolver_rtt_ready != NULL) {
             client_ctx->resolver_rtt_ready[resolver_index] = false;
         }
@@ -721,16 +766,15 @@ static size_t slipstream_client_find_resolver_by_path_id(slipstream_client_ctx_t
     return SIZE_MAX;
 }
 
-static uint64_t slipstream_client_latency_from_quality(const picoquic_path_quality_t* quality,
-                                                       bool allow_smoothed_fallback) {
-    if (quality->rtt_min != 0) {
-        return quality->rtt_min;
-    }
+static uint64_t slipstream_client_latency_from_quality(const picoquic_path_quality_t* quality) {
     if (quality->rtt_sample != 0) {
         return quality->rtt_sample;
     }
-    if (allow_smoothed_fallback && quality->rtt != 0) {
+    if (quality->rtt != 0) {
         return quality->rtt;
+    }
+    if (quality->rtt_min != 0) {
+        return quality->rtt_min;
     }
     return 0;
 }
@@ -758,6 +802,11 @@ static uint64_t slipstream_client_resolver_score(const slipstream_client_ctx_t* 
     if (client_ctx->resolver_rtt_ready == NULL || client_ctx->resolver_rtt_us == NULL ||
         resolver_index >= client_ctx->server_address_count ||
         !client_ctx->resolver_rtt_ready[resolver_index]) {
+        return UINT64_MAX;
+    }
+    if (client_ctx->resolver_sampled_at != NULL &&
+        (client_ctx->resolver_sampled_at[resolver_index] == 0 ||
+         current_time - client_ctx->resolver_sampled_at[resolver_index] > SLIPSTREAM_RESOLVER_SAMPLE_STALE_US)) {
         return UINT64_MAX;
     }
 
@@ -936,17 +985,37 @@ static bool slipstream_client_sample_resolver_latency(slipstream_client_ctx_t* c
         return false;
     }
 
-    const bool allow_smoothed = resolver_index == client_ctx->active_resolver_index;
-    uint64_t latency = slipstream_client_latency_from_quality(&quality, allow_smoothed);
+    uint64_t latency = slipstream_client_latency_from_quality(&quality);
     if (latency == 0) {
         return false;
     }
 
-    if (!client_ctx->resolver_rtt_ready[resolver_index] ||
-        latency < client_ctx->resolver_rtt_us[resolver_index]) {
-        client_ctx->resolver_rtt_us[resolver_index] = latency;
+    uint64_t previous_sent = client_ctx->resolver_sent == NULL ? 0 : client_ctx->resolver_sent[resolver_index];
+    uint64_t previous_lost = client_ctx->resolver_lost == NULL ? 0 : client_ctx->resolver_lost[resolver_index];
+    bool first_sample = !client_ctx->resolver_rtt_ready[resolver_index];
+    bool active_resolver = resolver_index == client_ctx->active_resolver_index;
+    bool fresh_observation = first_sample || active_resolver ||
+        quality.sent != previous_sent || quality.lost != previous_lost;
+
+    bool sample_ready = client_ctx->resolver_rtt_ready[resolver_index];
+    if (fresh_observation) {
+        if (first_sample || client_ctx->resolver_rtt_us[resolver_index] == 0) {
+            client_ctx->resolver_rtt_us[resolver_index] = latency;
+        } else {
+            client_ctx->resolver_rtt_us[resolver_index] =
+                (client_ctx->resolver_rtt_us[resolver_index] * 3 + latency) / 4;
+        }
+        if (client_ctx->resolver_sampled_at != NULL) {
+            client_ctx->resolver_sampled_at[resolver_index] = current_time;
+        }
+        sample_ready = true;
+    } else if (client_ctx->resolver_sampled_at != NULL &&
+        client_ctx->resolver_sampled_at[resolver_index] != 0 &&
+        current_time - client_ctx->resolver_sampled_at[resolver_index] > SLIPSTREAM_RESOLVER_SAMPLE_STALE_US) {
+        sample_ready = false;
     }
-    client_ctx->resolver_rtt_ready[resolver_index] = true;
+
+    client_ctx->resolver_rtt_ready[resolver_index] = sample_ready;
 
     if (client_ctx->resolver_sent != NULL) {
         client_ctx->resolver_sent[resolver_index] = quality.sent;
@@ -980,7 +1049,7 @@ static bool slipstream_client_sample_resolver_latency(slipstream_client_ctx_t* c
         slipstream_client_maybe_adapt_resolver_mtu(client_ctx, resolver_index, unique_path_id, current_time);
     }
 
-    return true;
+    return sample_ready;
 }
 
 static void slipstream_client_discover_resolver_paths(slipstream_client_ctx_t* client_ctx) {
@@ -1020,6 +1089,9 @@ static void slipstream_client_forget_resolver_path(slipstream_client_ctx_t* clie
             }
             if (client_ctx->resolver_rtt_ready != NULL) {
                 client_ctx->resolver_rtt_ready[i] = false;
+            }
+            if (client_ctx->resolver_sampled_at != NULL) {
+                client_ctx->resolver_sampled_at[i] = 0;
             }
             client_ctx->server_addresses[i].added = false;
         }
@@ -1080,6 +1152,9 @@ static size_t slipstream_client_best_sampled_resolver(const slipstream_client_ct
             continue;
         }
         uint64_t score = slipstream_client_resolver_score(client_ctx, i, current_time, false);
+        if (score == UINT64_MAX) {
+            continue;
+        }
         if (!*has_sample || score < best_score) {
             *has_sample = true;
             best_score = score;
@@ -1092,12 +1167,14 @@ static size_t slipstream_client_best_sampled_resolver(const slipstream_client_ct
 
 static void slipstream_client_log_resolver_selection(slipstream_client_ctx_t* client_ctx,
                                                      size_t best_index,
-                                                     bool has_sample) {
+                                                     bool has_sample,
+                                                     uint64_t current_time) {
     char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
     for (size_t i = 0; i < client_ctx->server_address_count; i++) {
         const char* formatted = slipstream_format_sockaddr(&client_ctx->server_addresses[i].server_address,
                                                            resolver_text, sizeof(resolver_text));
-        if (client_ctx->resolver_rtt_ready != NULL && client_ctx->resolver_rtt_ready[i]) {
+        if (client_ctx->resolver_rtt_ready != NULL && client_ctx->resolver_rtt_ready[i] &&
+            slipstream_client_resolver_score(client_ctx, i, current_time, true) != UINT64_MAX) {
             uint64_t loss_permille = client_ctx->resolver_loss_permille == NULL ? 0 :
                 client_ctx->resolver_loss_permille[i];
             uint64_t cwin = client_ctx->resolver_cwin == NULL ? 0 :
@@ -1127,6 +1204,73 @@ static void slipstream_client_log_resolver_selection(slipstream_client_ctx_t* cl
     }
 }
 
+static size_t slipstream_client_next_available_resolver(const slipstream_client_ctx_t* client_ctx,
+                                                        uint64_t current_time) {
+    if (client_ctx->server_address_count == 0) {
+        return 0;
+    }
+
+    size_t active_index = client_ctx->active_resolver_index;
+    if (active_index >= client_ctx->server_address_count) {
+        active_index = 0;
+    }
+
+    for (size_t offset = 1; offset < client_ctx->server_address_count; offset++) {
+        size_t resolver_index = (active_index + offset) % client_ctx->server_address_count;
+        if (!slipstream_client_resolver_in_cooldown(client_ctx, resolver_index, current_time)) {
+            return resolver_index;
+        }
+    }
+
+    return slipstream_client_next_resolver_index(client_ctx, active_index);
+}
+
+static void slipstream_client_select_resolver(slipstream_client_ctx_t* client_ctx,
+                                              size_t resolver_index,
+                                              uint64_t current_time,
+                                              bool force_reconnect,
+                                              const char* reason) {
+    if (resolver_index >= client_ctx->server_address_count ||
+        resolver_index == client_ctx->active_resolver_index) {
+        return;
+    }
+
+    char old_text[NI_MAXHOST + NI_MAXSERV + 8];
+    char new_text[NI_MAXHOST + NI_MAXSERV + 8];
+    size_t old_index = client_ctx->active_resolver_index;
+    fprintf(stderr,
+            "Client selected resolver (%s): old=%s index=%zu/%zu new=%s index=%zu/%zu\n",
+            reason,
+            old_index < client_ctx->server_address_count ?
+                slipstream_format_sockaddr(&client_ctx->server_addresses[old_index].server_address,
+                                           old_text, sizeof(old_text)) : "unknown",
+            old_index + 1, client_ctx->server_address_count,
+            slipstream_format_sockaddr(&client_ctx->server_addresses[resolver_index].server_address,
+                                       new_text, sizeof(new_text)),
+            resolver_index + 1, client_ctx->server_address_count);
+
+    client_ctx->next_resolver_index = resolver_index;
+    if (client_ctx->first_stream == NULL || force_reconnect) {
+        client_ctx->resolver_switch_pending = true;
+        client_ctx->resolver_failover_pending = force_reconnect;
+        client_ctx->reconnect_pending = true;
+        client_ctx->reconnect_at = current_time;
+        fprintf(stderr,
+                "Client scheduled immediate reconnect to make resolver index=%zu/%zu the main resolver%s\n",
+                resolver_index + 1, client_ctx->server_address_count,
+                force_reconnect ? " (active resolver unhealthy)" : "");
+    } else {
+        fprintf(stderr,
+                "Client using resolver index=%zu/%zu as preferred path; it will become main on the next reconnect\n",
+                resolver_index + 1, client_ctx->server_address_count);
+    }
+
+    slipstream_client_apply_resolver_path_priorities(client_ctx, resolver_index);
+    if (client_ctx->cnx != NULL) {
+        picoquic_reinsert_by_wake_time(client_ctx->cnx->quic, client_ctx->cnx, current_time);
+    }
+}
+
 static void slipstream_client_finish_resolver_selection(slipstream_client_ctx_t* client_ctx,
                                                         uint64_t current_time) {
     if (!client_ctx->resolver_selection_in_progress) {
@@ -1151,44 +1295,19 @@ static void slipstream_client_finish_resolver_selection(slipstream_client_ctx_t*
         }
     }
 
-    slipstream_client_log_resolver_selection(client_ctx, best_index, has_sample);
+    slipstream_client_log_resolver_selection(client_ctx, best_index, has_sample, current_time);
     client_ctx->resolver_selection_in_progress = false;
     client_ctx->resolver_selection_done = true;
+    client_ctx->resolver_reselection_next_at = current_time + SLIPSTREAM_RESOLVER_RESELECTION_INTERVAL_US;
 
     if (has_sample && best_index != client_ctx->active_resolver_index) {
-        char old_text[NI_MAXHOST + NI_MAXSERV + 8];
-        char new_text[NI_MAXHOST + NI_MAXSERV + 8];
-        size_t old_index = client_ctx->active_resolver_index;
-        fprintf(stderr,
-                "Client selected better resolver: old=%s index=%zu/%zu new=%s index=%zu/%zu\n",
-                slipstream_format_sockaddr(&client_ctx->server_addresses[old_index].server_address,
-                                           old_text, sizeof(old_text)),
-                old_index + 1, client_ctx->server_address_count,
-                slipstream_format_sockaddr(&client_ctx->server_addresses[best_index].server_address,
-                                           new_text, sizeof(new_text)),
-                best_index + 1, client_ctx->server_address_count);
-
-        client_ctx->next_resolver_index = best_index;
-        if (client_ctx->first_stream == NULL) {
-            client_ctx->resolver_switch_pending = true;
-            client_ctx->reconnect_pending = true;
-            client_ctx->reconnect_at = current_time;
-            fprintf(stderr,
-                    "Client scheduled immediate reconnect to make resolver index=%zu/%zu the main resolver\n",
-                    best_index + 1, client_ctx->server_address_count);
-        } else {
-            client_ctx->active_resolver_index = best_index;
-            fprintf(stderr,
-                    "Client using resolver index=%zu/%zu as preferred path; it will become main on the next reconnect\n",
-                    best_index + 1, client_ctx->server_address_count);
-        }
+        slipstream_client_select_resolver(client_ctx, best_index, current_time, false, "better path");
     } else {
         client_ctx->next_resolver_index = client_ctx->active_resolver_index;
-    }
-
-    slipstream_client_apply_resolver_path_priorities(client_ctx, best_index);
-    if (client_ctx->cnx != NULL) {
-        picoquic_reinsert_by_wake_time(client_ctx->cnx->quic, client_ctx->cnx, current_time);
+        slipstream_client_apply_resolver_path_priorities(client_ctx, best_index);
+        if (client_ctx->cnx != NULL) {
+            picoquic_reinsert_by_wake_time(client_ctx->cnx->quic, client_ctx->cnx, current_time);
+        }
     }
 }
 
@@ -1246,7 +1365,7 @@ static bool slipstream_client_should_log_resolver_quality(slipstream_client_ctx_
 static void slipstream_client_start_resolver_selection(slipstream_client_ctx_t* client_ctx,
                                                        picoquic_cnx_t* cnx,
                                                        uint64_t current_time) {
-    if (client_ctx->server_address_count <= 1 || client_ctx->resolver_selection_done ||
+    if (client_ctx->server_address_count <= 1 ||
         client_ctx->resolver_selection_in_progress || client_ctx->resolver_path_ids == NULL ||
         client_ctx->active_resolver_index >= client_ctx->server_address_count ||
         cnx == NULL || cnx->path[0] == NULL) {
@@ -1254,11 +1373,14 @@ static void slipstream_client_start_resolver_selection(slipstream_client_ctx_t* 
     }
 
     client_ctx->resolver_selection_in_progress = true;
+    client_ctx->resolver_selection_done = false;
     client_ctx->resolver_selection_started_at = current_time;
     client_ctx->resolver_selection_deadline_at = current_time + SLIPSTREAM_RESOLVER_SELECTION_TIMEOUT_US;
+    client_ctx->resolver_reselection_next_at = current_time + SLIPSTREAM_RESOLVER_RESELECTION_INTERVAL_US;
 
     uint64_t active_path_id = cnx->path[0]->unique_path_id;
     slipstream_client_record_resolver_path_id(client_ctx, client_ctx->active_resolver_index, active_path_id);
+    (void)slipstream_client_sample_resolver_latency(client_ctx, client_ctx->active_resolver_index, active_path_id);
     picoquic_subscribe_to_quality_update(cnx, 0, SLIPSTREAM_RESOLVER_SELECTION_RTT_DELTA_US);
     slipstream_client_discover_resolver_paths(client_ctx);
 
@@ -1267,6 +1389,105 @@ static void slipstream_client_start_resolver_selection(slipstream_client_ctx_t* 
             client_ctx->server_address_count,
             (double)SLIPSTREAM_RESOLVER_SELECTION_MIN_US / 1000000.0,
             (double)SLIPSTREAM_RESOLVER_SELECTION_TIMEOUT_US / 1000000.0);
+}
+
+static bool slipstream_client_resolver_health_bad(const slipstream_client_ctx_t* client_ctx,
+                                                  size_t resolver_index) {
+    if (resolver_index >= client_ctx->server_address_count ||
+        client_ctx->resolver_loss_permille == NULL) {
+        return false;
+    }
+
+    uint64_t loss_permille = client_ctx->resolver_loss_permille[resolver_index];
+    bool cwin_collapsed = client_ctx->resolver_cwin != NULL &&
+        client_ctx->resolver_cwin[resolver_index] > 0 &&
+        client_ctx->resolver_cwin[resolver_index] <= SLIPSTREAM_RESOLVER_CWIN_COLLAPSED_BYTES;
+
+    return loss_permille >= SLIPSTREAM_RESOLVER_ACTIVE_BAD_LOSS_PERMILLE ||
+        (cwin_collapsed && loss_permille > 0);
+}
+
+static void slipstream_client_maybe_failover_active_resolver(slipstream_client_ctx_t* client_ctx,
+                                                             uint64_t current_time) {
+    if (client_ctx->server_address_count <= 1 || client_ctx->reconnect_pending ||
+        client_ctx->active_resolver_index >= client_ctx->server_address_count ||
+        current_time < client_ctx->resolver_failover_next_at) {
+        return;
+    }
+
+    size_t active_index = client_ctx->active_resolver_index;
+    if (!slipstream_client_resolver_health_bad(client_ctx, active_index)) {
+        client_ctx->active_resolver_bad_windows = 0;
+        return;
+    }
+
+    if (client_ctx->active_resolver_bad_windows < UINT8_MAX) {
+        client_ctx->active_resolver_bad_windows++;
+    }
+    if (client_ctx->active_resolver_bad_windows < SLIPSTREAM_RESOLVER_ACTIVE_BAD_WINDOWS) {
+        return;
+    }
+
+    if (client_ctx->resolver_unhealthy_until != NULL) {
+        client_ctx->resolver_unhealthy_until[active_index] =
+            current_time + SLIPSTREAM_RESOLVER_UNHEALTHY_COOLDOWN_US;
+    }
+
+    bool has_sample = false;
+    size_t best_index = slipstream_client_best_sampled_resolver(client_ctx, &has_sample, current_time);
+    if (!has_sample || best_index == active_index || best_index >= client_ctx->server_address_count) {
+        best_index = slipstream_client_next_available_resolver(client_ctx, current_time);
+    }
+    if (best_index == active_index || best_index >= client_ctx->server_address_count) {
+        return;
+    }
+
+    uint64_t loss_permille = client_ctx->resolver_loss_permille == NULL ? 0 :
+        client_ctx->resolver_loss_permille[active_index];
+    uint64_t cwin = client_ctx->resolver_cwin == NULL ? 0 :
+        client_ctx->resolver_cwin[active_index];
+    size_t mtu = client_ctx->resolver_send_mtu == NULL ? client_query_payload_budget :
+        slipstream_client_clamp_adaptive_mtu(client_ctx->resolver_send_mtu[active_index]);
+    fprintf(stderr,
+            "Client active resolver unhealthy: index=%zu/%zu loss=%.1f%% cwin=%llu mtu=%zu; trying resolver index=%zu/%zu\n",
+            active_index + 1, client_ctx->server_address_count,
+            (double)loss_permille / 10.0,
+            (unsigned long long)cwin,
+            mtu,
+            best_index + 1, client_ctx->server_address_count);
+
+    client_ctx->active_resolver_bad_windows = 0;
+    client_ctx->resolver_failover_next_at = current_time + SLIPSTREAM_RESOLVER_FAILOVER_MIN_INTERVAL_US;
+    slipstream_client_select_resolver(client_ctx, best_index, current_time, true, "active unhealthy");
+}
+
+static void slipstream_client_run_resolver_health_check(slipstream_client_ctx_t* client_ctx,
+                                                        uint64_t current_time) {
+    if (!client_ctx->ready || client_ctx->cnx == NULL) {
+        return;
+    }
+    if (client_ctx->resolver_health_next_at != 0 &&
+        current_time < client_ctx->resolver_health_next_at) {
+        return;
+    }
+    client_ctx->resolver_health_next_at = current_time + SLIPSTREAM_RESOLVER_HEALTH_CHECK_INTERVAL_US;
+
+    if (client_ctx->cnx->path[0] != NULL &&
+        client_ctx->active_resolver_index < client_ctx->server_address_count) {
+        uint64_t active_path_id = client_ctx->cnx->path[0]->unique_path_id;
+        slipstream_client_record_resolver_path_id(client_ctx, client_ctx->active_resolver_index, active_path_id);
+        (void)slipstream_client_sample_resolver_latency(client_ctx, client_ctx->active_resolver_index,
+                                                        active_path_id);
+    }
+
+    slipstream_client_discover_resolver_paths(client_ctx);
+    slipstream_client_maybe_finish_resolver_selection(client_ctx, current_time);
+    if (!client_ctx->resolver_selection_in_progress &&
+        (client_ctx->resolver_reselection_next_at == 0 ||
+         current_time >= client_ctx->resolver_reselection_next_at)) {
+        slipstream_client_start_resolver_selection(client_ctx, client_ctx->cnx, current_time);
+    }
+    slipstream_client_maybe_failover_active_resolver(client_ctx, current_time);
 }
 
 static int slipstream_client_connect_resolver(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx,
@@ -1357,17 +1578,20 @@ static void slipstream_client_check_connect_timeout(slipstream_client_ctx_t* cli
 }
 
 static int slipstream_client_reconnect(picoquic_quic_t* quic, slipstream_client_ctx_t* client_ctx) {
-    if (client_ctx->resolver_switch_pending && client_ctx->first_stream != NULL) {
+    if (client_ctx->resolver_switch_pending && !client_ctx->resolver_failover_pending &&
+        client_ctx->first_stream != NULL) {
         fprintf(stderr,
                 "Client resolver switch deferred because local TCP streams are active; preferred resolver index=%zu/%zu\n",
                 client_ctx->next_resolver_index + 1, client_ctx->server_address_count);
         client_ctx->active_resolver_index = client_ctx->next_resolver_index;
         client_ctx->reconnect_pending = false;
         client_ctx->resolver_switch_pending = false;
+        client_ctx->resolver_failover_pending = false;
         slipstream_client_apply_resolver_path_priorities(client_ctx, client_ctx->active_resolver_index);
         return 0;
     }
     client_ctx->resolver_switch_pending = false;
+    client_ctx->resolver_failover_pending = false;
 
     while (client_ctx->first_stream != NULL) {
         slipstream_client_free_stream_ctx(client_ctx, client_ctx->first_stream);
@@ -1554,8 +1778,9 @@ int slipstream_client_sockloop_callback(picoquic_quic_t* quic, picoquic_packet_l
         }
 
         if (client_ctx->ready) {
+            uint64_t current_time = picoquic_current_time();
             slipstream_add_paths(client_ctx);
-            slipstream_client_maybe_finish_resolver_selection(client_ctx, picoquic_current_time());
+            slipstream_client_run_resolver_health_check(client_ctx, current_time);
         }
         slipstream_client_mark_active_pass(client_ctx);
         slipstream_client_schedule_active_poll(client_ctx, picoquic_current_time());
@@ -1951,11 +2176,15 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
         fprintf(stderr, "Client resolver path deleted: id=%llu\n", (unsigned long long)stream_id);
         break;
     case picoquic_callback_path_quality_changed:
+    {
+        uint64_t current_time = picoquic_current_time();
         slipstream_client_note_resolver_path_event(client_ctx, cnx, stream_id);
-        if (slipstream_client_should_log_resolver_quality(client_ctx, cnx, stream_id, picoquic_current_time())) {
+        slipstream_client_maybe_failover_active_resolver(client_ctx, current_time);
+        if (slipstream_client_should_log_resolver_quality(client_ctx, cnx, stream_id, current_time)) {
             slipstream_client_log_path_event(cnx, stream_id, "quality changed");
         }
         break;
+    }
     case picoquic_callback_app_wakeup:
         if (client_ctx->ready && client_ctx->first_stream != NULL) {
             cnx->is_poll_requested = 1;
@@ -2125,6 +2354,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     client_ctx.resolver_last_lost = calloc(server_address_count, sizeof(*client_ctx.resolver_last_lost));
     client_ctx.resolver_loss_permille = calloc(server_address_count, sizeof(*client_ctx.resolver_loss_permille));
     client_ctx.resolver_cwin = calloc(server_address_count, sizeof(*client_ctx.resolver_cwin));
+    client_ctx.resolver_sampled_at = calloc(server_address_count, sizeof(*client_ctx.resolver_sampled_at));
     client_ctx.resolver_unhealthy_until = calloc(server_address_count, sizeof(*client_ctx.resolver_unhealthy_until));
     client_ctx.resolver_quality_log_next_at = calloc(server_address_count, sizeof(*client_ctx.resolver_quality_log_next_at));
     client_ctx.resolver_send_mtu = calloc(server_address_count, sizeof(*client_ctx.resolver_send_mtu));
@@ -2136,6 +2366,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         client_ctx.resolver_sent == NULL || client_ctx.resolver_lost == NULL ||
         client_ctx.resolver_last_sent == NULL || client_ctx.resolver_last_lost == NULL ||
         client_ctx.resolver_loss_permille == NULL || client_ctx.resolver_cwin == NULL ||
+        client_ctx.resolver_sampled_at == NULL ||
         client_ctx.resolver_unhealthy_until == NULL || client_ctx.resolver_quality_log_next_at == NULL ||
         client_ctx.resolver_send_mtu == NULL || client_ctx.resolver_mtu_adjusted_at == NULL ||
         client_ctx.resolver_mtu_good_windows == NULL || client_ctx.resolver_rtt_ready == NULL) {
@@ -2150,6 +2381,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
         free(client_ctx.resolver_last_lost);
         free(client_ctx.resolver_loss_permille);
         free(client_ctx.resolver_cwin);
+        free(client_ctx.resolver_sampled_at);
         free(client_ctx.resolver_unhealthy_until);
         free(client_ctx.resolver_quality_log_next_at);
         free(client_ctx.resolver_send_mtu);
@@ -2259,6 +2491,7 @@ int picoquic_slipstream_client(int listen_port, struct st_address_t* server_addr
     free(client_ctx.resolver_last_lost);
     free(client_ctx.resolver_loss_permille);
     free(client_ctx.resolver_cwin);
+    free(client_ctx.resolver_sampled_at);
     free(client_ctx.resolver_unhealthy_until);
     free(client_ctx.resolver_quality_log_next_at);
     free(client_ctx.resolver_send_mtu);

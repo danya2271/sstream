@@ -41,7 +41,7 @@ void client_sighandler(int signum) {
 }
 
 #define SLIPSTREAM_ACTIVE_POLL_INTERVAL_US 20000
-#define SLIPSTREAM_RESOLVER_CONNECT_TIMEOUT_US 3000000
+#define SLIPSTREAM_RESOLVER_CONNECT_TIMEOUT_US 10000000
 #define SLIPSTREAM_RESOLVER_PROBE_INITIAL_DELAY_US 1000000
 #define SLIPSTREAM_RESOLVER_PROBE_MAX_DELAY_US 30000000
 #define SLIPSTREAM_RESOLVER_SELECTION_MIN_US 1000000
@@ -68,7 +68,7 @@ void client_sighandler(int signum) {
 #define SLIPSTREAM_RESOLVER_SAMPLE_STALE_US 12000000
 #define SLIPSTREAM_RESOLVER_FAILOVER_MIN_INTERVAL_US 8000000
 #define SLIPSTREAM_RESOLVER_ACTIVE_BAD_LOSS_PERMILLE 200
-#define SLIPSTREAM_RESOLVER_ACTIVE_BAD_WINDOWS 2
+#define SLIPSTREAM_RESOLVER_ACTIVE_BAD_WINDOWS 4
 
 static socklen_t slipstream_sockaddr_len(const struct sockaddr_storage* addr) {
     if (addr->ss_family == AF_INET) {
@@ -850,6 +850,32 @@ static size_t slipstream_client_clamp_adaptive_mtu(size_t mtu) {
     return mtu;
 }
 
+static size_t slipstream_client_connect_mtu_floor(void) {
+    size_t floor = slipstream_client_adaptive_mtu_floor();
+    if (floor < PICOQUIC_ENFORCED_INITIAL_MTU &&
+        client_query_payload_budget >= PICOQUIC_ENFORCED_INITIAL_MTU) {
+        floor = PICOQUIC_ENFORCED_INITIAL_MTU;
+    }
+    return floor;
+}
+
+static size_t slipstream_client_clamp_connect_mtu(size_t mtu) {
+    size_t floor = slipstream_client_connect_mtu_floor();
+    if (mtu < floor) {
+        mtu = floor;
+    }
+    if (mtu > client_query_payload_budget) {
+        mtu = client_query_payload_budget;
+    }
+    return mtu;
+}
+
+static void slipstream_client_set_path_mtu(picoquic_path_t* path, size_t target_mtu) {
+    path->send_mtu = target_mtu;
+    path->send_mtu_max_tried = target_mtu;
+    path->mtu_probe_sent = 0;
+}
+
 static void slipstream_client_apply_resolver_mtu(slipstream_client_ctx_t* client_ctx,
                                                  size_t resolver_index,
                                                  uint64_t unique_path_id,
@@ -874,9 +900,7 @@ static void slipstream_client_apply_resolver_mtu(slipstream_client_ctx_t* client
 
     char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
     size_t old_mtu = path->send_mtu;
-    path->send_mtu = target_mtu;
-    path->send_mtu_max_tried = target_mtu;
-    path->mtu_probe_sent = 0;
+    slipstream_client_set_path_mtu(path, target_mtu);
     uint64_t loss_permille = client_ctx->resolver_loss_permille == NULL ? 0 :
         client_ctx->resolver_loss_permille[resolver_index];
     uint64_t cwin = client_ctx->resolver_cwin == NULL ? 0 :
@@ -891,6 +915,73 @@ static void slipstream_client_apply_resolver_mtu(slipstream_client_ctx_t* client
             old_mtu, target_mtu,
             (double)loss_permille / 10.0,
             (unsigned long long)cwin);
+}
+
+static void slipstream_client_apply_resolver_connect_mtu(slipstream_client_ctx_t* client_ctx,
+                                                         size_t resolver_index) {
+    if (client_ctx->cnx == NULL || client_ctx->resolver_send_mtu == NULL ||
+        resolver_index >= client_ctx->server_address_count ||
+        client_ctx->cnx->path[0] == NULL) {
+        return;
+    }
+
+    picoquic_path_t* path = client_ctx->cnx->path[0];
+    size_t target_mtu = slipstream_client_clamp_connect_mtu(client_ctx->resolver_send_mtu[resolver_index]);
+    if (target_mtu == 0 || path->send_mtu == target_mtu) {
+        return;
+    }
+
+    char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+    size_t old_mtu = path->send_mtu;
+    slipstream_client_set_path_mtu(path, target_mtu);
+    fprintf(stderr,
+            "Client resolver connect MTU applied: index=%zu/%zu resolver=%s old=%zu new=%zu\n",
+            resolver_index + 1, client_ctx->server_address_count,
+            slipstream_format_sockaddr(&client_ctx->server_addresses[resolver_index].server_address,
+                                       resolver_text, sizeof(resolver_text)),
+            old_mtu, target_mtu);
+}
+
+static void slipstream_client_note_resolver_connect_timeout(slipstream_client_ctx_t* client_ctx,
+                                                            size_t resolver_index,
+                                                            uint64_t current_time) {
+    if (client_ctx->resolver_send_mtu == NULL ||
+        resolver_index >= client_ctx->server_address_count) {
+        return;
+    }
+
+    size_t current_mtu = client_ctx->resolver_send_mtu[resolver_index];
+    if (current_mtu == 0) {
+        current_mtu = client_query_payload_budget;
+    }
+    current_mtu = slipstream_client_clamp_connect_mtu(current_mtu);
+
+    size_t floor = slipstream_client_connect_mtu_floor();
+    if (current_mtu <= floor) {
+        return;
+    }
+
+    size_t step = current_mtu / 4;
+    if (step < SLIPSTREAM_RESOLVER_MTU_STEP_MIN_BYTES) {
+        step = SLIPSTREAM_RESOLVER_MTU_STEP_MIN_BYTES;
+    }
+    size_t next_mtu = current_mtu > step ? current_mtu - step : floor;
+    if (next_mtu < floor) {
+        next_mtu = floor;
+    }
+
+    client_ctx->resolver_send_mtu[resolver_index] = next_mtu;
+    if (client_ctx->resolver_mtu_adjusted_at != NULL) {
+        client_ctx->resolver_mtu_adjusted_at[resolver_index] = current_time;
+    }
+
+    char resolver_text[NI_MAXHOST + NI_MAXSERV + 8];
+    fprintf(stderr,
+            "Client resolver connect MTU reduced after timeout: index=%zu/%zu resolver=%s old=%zu new=%zu\n",
+            resolver_index + 1, client_ctx->server_address_count,
+            slipstream_format_sockaddr(&client_ctx->server_addresses[resolver_index].server_address,
+                                       resolver_text, sizeof(resolver_text)),
+            current_mtu, next_mtu);
 }
 
 static void slipstream_client_maybe_adapt_resolver_mtu(slipstream_client_ctx_t* client_ctx,
@@ -1204,27 +1295,6 @@ static void slipstream_client_log_resolver_selection(slipstream_client_ctx_t* cl
     }
 }
 
-static size_t slipstream_client_next_available_resolver(const slipstream_client_ctx_t* client_ctx,
-                                                        uint64_t current_time) {
-    if (client_ctx->server_address_count == 0) {
-        return 0;
-    }
-
-    size_t active_index = client_ctx->active_resolver_index;
-    if (active_index >= client_ctx->server_address_count) {
-        active_index = 0;
-    }
-
-    for (size_t offset = 1; offset < client_ctx->server_address_count; offset++) {
-        size_t resolver_index = (active_index + offset) % client_ctx->server_address_count;
-        if (!slipstream_client_resolver_in_cooldown(client_ctx, resolver_index, current_time)) {
-            return resolver_index;
-        }
-    }
-
-    return slipstream_client_next_resolver_index(client_ctx, active_index);
-}
-
 static void slipstream_client_select_resolver(slipstream_client_ctx_t* client_ctx,
                                               size_t resolver_index,
                                               uint64_t current_time,
@@ -1436,9 +1506,9 @@ static void slipstream_client_maybe_failover_active_resolver(slipstream_client_c
     bool has_sample = false;
     size_t best_index = slipstream_client_best_sampled_resolver(client_ctx, &has_sample, current_time);
     if (!has_sample || best_index == active_index || best_index >= client_ctx->server_address_count) {
-        best_index = slipstream_client_next_available_resolver(client_ctx, current_time);
-    }
-    if (best_index == active_index || best_index >= client_ctx->server_address_count) {
+        fprintf(stderr,
+                "Client active resolver unhealthy, but no verified better resolver is available yet; keeping current resolver\n");
+        client_ctx->active_resolver_bad_windows = 0;
         return;
     }
 
@@ -1458,7 +1528,7 @@ static void slipstream_client_maybe_failover_active_resolver(slipstream_client_c
 
     client_ctx->active_resolver_bad_windows = 0;
     client_ctx->resolver_failover_next_at = current_time + SLIPSTREAM_RESOLVER_FAILOVER_MIN_INTERVAL_US;
-    slipstream_client_select_resolver(client_ctx, best_index, current_time, true, "active unhealthy");
+    slipstream_client_select_resolver(client_ctx, best_index, current_time, false, "active unhealthy");
 }
 
 static void slipstream_client_run_resolver_health_check(slipstream_client_ctx_t* client_ctx,
@@ -1508,6 +1578,7 @@ static int slipstream_client_connect_resolver(picoquic_quic_t* quic, slipstream_
         client_ctx->active_resolver_index = resolver_index;
         client_ctx->next_resolver_index = slipstream_client_next_resolver_index(client_ctx, resolver_index);
         client_ctx->connect_started_at = picoquic_current_time();
+        slipstream_client_apply_resolver_connect_mtu(client_ctx, resolver_index);
     }
     return ret;
 }
@@ -1567,6 +1638,7 @@ static void slipstream_client_check_connect_timeout(slipstream_client_ctx_t* cli
                 slipstream_format_sockaddr(&client_ctx->server_addresses[client_ctx->active_resolver_index].server_address,
                                            resolver_text, sizeof(resolver_text)),
                 client_ctx->active_resolver_index + 1, client_ctx->server_address_count);
+        slipstream_client_note_resolver_connect_timeout(client_ctx, client_ctx->active_resolver_index, current_time);
     } else {
         fprintf(stderr, "Client QUIC connect timed out; trying next resolver\n");
     }
@@ -2179,7 +2251,6 @@ int slipstream_client_callback(picoquic_cnx_t* cnx,
     {
         uint64_t current_time = picoquic_current_time();
         slipstream_client_note_resolver_path_event(client_ctx, cnx, stream_id);
-        slipstream_client_maybe_failover_active_resolver(client_ctx, current_time);
         if (slipstream_client_should_log_resolver_quality(client_ctx, cnx, stream_id, current_time)) {
             slipstream_client_log_path_event(cnx, stream_id, "quality changed");
         }

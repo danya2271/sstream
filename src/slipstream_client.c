@@ -1752,8 +1752,8 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
         // }
 
         char addr_text[NI_MAXHOST + NI_MAXSERV + 8];
-        fprintf(stderr, "Client probing resolver path: %s\n",
-                slipstream_format_sockaddr(&slipstream_path->server_address, addr_text, sizeof(addr_text)));
+        //fprintf(stderr, "Client probing resolver path: %s\n",
+        //        slipstream_format_sockaddr(&slipstream_path->server_address, addr_text, sizeof(addr_text)));
         int path_id = -2;
         int probe_ret = picoquic_probe_new_path_ex(cnx, (struct sockaddr*)&slipstream_path->server_address, (struct sockaddr*)&cnx->path[0]->local_addr, 0, current_time, 0, &path_id);
         if (path_id < 0) {
@@ -1771,8 +1771,8 @@ void slipstream_add_paths(slipstream_client_ctx_t* client_ctx) {
                 }
             }
             DBG_PRINTF("Failed adding path", NULL);
-            fprintf(stderr, "Client resolver path probe failed: %s ret=%d; retry in %.1f seconds\n",
-                    addr_text, probe_ret, (double)delay / 1000000.0);
+            //fprintf(stderr, "Client resolver path probe failed: %s ret=%d; retry in %.1f seconds\n",
+            //        addr_text, probe_ret, (double)delay / 1000000.0);
             continue;
         }
         DBG_PRINTF("Added path", NULL);

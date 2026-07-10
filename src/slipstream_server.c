@@ -16,6 +16,7 @@
 #include <sys/param.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 #include <assert.h>
 #include <strings.h>
 #include <picoquic_internal.h>
@@ -343,6 +344,24 @@ slipstream_server_stream_ctx_t* slipstream_server_create_stream_ctx(slipstream_s
 
     if (pipe(stream_ctx->pipefd) < 0) {
         perror("pipe() failed");
+        free(stream_ctx);
+        return NULL;
+    }
+
+    /*
+     * Stream data is delivered by the QUIC/network thread to a worker through
+     * this pipe. The network thread must never wait for a slow or wedged
+     * upstream consumer: a full blocking pipe otherwise freezes DNS/QUIC
+     * processing for every connection. Preserve the blocking read side for
+     * the worker, but make the producer non-blocking and reset only the
+     * overloaded stream if its queue is full.
+     */
+    const int pipe_write_flags = fcntl(stream_ctx->pipefd[1], F_GETFL);
+    if (pipe_write_flags < 0 ||
+        fcntl(stream_ctx->pipefd[1], F_SETFL, pipe_write_flags | O_NONBLOCK) < 0) {
+        perror("fcntl() failed while configuring stream pipe");
+        close(stream_ctx->pipefd[0]);
+        close(stream_ctx->pipefd[1]);
         free(stream_ctx);
         return NULL;
     }
@@ -766,6 +785,13 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             }
 
             slipstream_io_copy_args* args = malloc(sizeof(slipstream_io_copy_args));
+            if (args == NULL) {
+                fprintf(stderr, "Server stream setup failed: id=%llu error=out of memory\n",
+                        (unsigned long long)stream_id);
+                slipstream_server_free_stream_context(server_ctx, stream_ctx, "worker allocation failure");
+                (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                return 0;
+            }
             args->pipe = stream_ctx->pipefd[0];
             args->socket = stream_ctx->fd;
             args->stream_id = stream_ctx->stream_id;
@@ -780,7 +806,10 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             if (pthread_create(&thread, NULL, slipstream_io_copy, args) != 0) {
                 perror("pthread_create() failed for thread1");
                 free(args);
-                slipstream_stream_release(stream_ctx); // Release if thread fail
+                slipstream_stream_release(stream_ctx);
+                slipstream_server_free_stream_context(server_ctx, stream_ctx, "worker creation failure");
+                (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_INTERNAL_ERROR);
+                return 0;
             } else {
                 pthread_detach(thread);
             }
@@ -790,9 +819,13 @@ int slipstream_server_callback(picoquic_cnx_t* cnx,
             // Check if pipe is still valid
             if (stream_ctx->pipefd[1] != -1) {
                 if (slipstream_write_all(stream_ctx->pipefd[1], bytes, length) != 0) {
-                    // Pipe broken
+                    /* A full non-blocking pipe means this stream's upstream
+                     * worker is not consuming data. Do not let it stall the
+                     * shared QUIC packet loop; terminate this stream instead.
+                     */
                     fprintf(stderr, "Server stream pipe write failed: id=%llu fd=%d error=%s (%d)\n",
                             (unsigned long long)stream_id, stream_ctx->fd, strerror(errno), errno);
+                    slipstream_server_free_stream_context(server_ctx, stream_ctx, "upstream backpressure");
                     (void)picoquic_reset_stream(cnx, stream_id, SLIPSTREAM_FILE_CANCEL_ERROR);
                     return 0;
                 }

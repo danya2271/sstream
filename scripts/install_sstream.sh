@@ -265,6 +265,10 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$SLIPSTREAM_BIN_ARG --domain $SLIPSTREAM_DOMAIN_ARG --dns-listen-port $SLIPSTREAM_DNS_PORT_ARG --target-address $SLIPSTREAM_TARGET_ARG --cert $SLIPSTREAM_CERT_ARG --key $SLIPSTREAM_KEY_ARG --mtu $SLIPSTREAM_MTU_ARG
 Restart=always
 RestartSec=2
+# Bound the lifetime even if the process remains alive but stops making
+# progress. With Restart=always, systemd starts a fresh server every 3 hours.
+RuntimeMaxSec=3h
+TimeoutStopSec=3s
 StandardOutput=journal
 StandardError=journal
 LimitNOFILE=65535
